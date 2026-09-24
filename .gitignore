@@ -1,0 +1,19 @@
+# Fork 仓库目录(在 sigma-file-manager/ 子目录里独立管理)
+sigma-file-manager/
+sigma-batch-rename/
+
+# 临时下载/草稿
+*.tmp
+*.bak
+.DS_Store
+Thumbs.db
+
+# 各种本地缓存
+*.log
+.cache/
+.idea/
+.vscode/
+
+# 本地笔记草稿(只追踪 docs/ 下的正式文档)
+drafts/
+*.draft.md
