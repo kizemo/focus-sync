@@ -84,3 +84,38 @@ Comment draft will follow the same template as Step 1.
 - **Internal consistency**: Strategy is "ask first", all steps follow that principle.
 - **Scope**: One communication action + one PR (conditional) — appropriately bounded.
 - **Ambiguity**: Step 2 branches are explicit; no overlap between fork-only and PR paths.
+
+## Step 3 Execution Log — Dialog Focus Sync (executed 2026-09-26)
+
+### Action
+
+New upstream issue opened at https://github.com/aleksey-hoffman/sigma-file-manager/issues/547 — "Feature Request: file dialog follows current navigator directory on focus return".
+
+Author: `kizemo`. State: OPEN. Labels / assignees: none (awaiting maintainer triage).
+
+### Posture
+
+Same as Step 1 — polite inquiry, no PR yet. Body describes:
+- The feature (Listary-style quick-switch: picker follows navigator path on focus return + on path change).
+- The implementation split (Rust picker-worker + Pinia store + `navigator.vue` `watch`/`onFocusChanged` wiring) with citations to the project's existing focus pattern (`use-clipboard-focus-sync.ts`).
+- The fork branch (`feat/dialog-focus-sync`, 10 commits ahead of `upstream/main`) and the picker command names (`picker_open` / `picker_set_folder` / `picker_close`).
+- Honest status: unit-test side is green (`cargo check` 0 errors, `vue-tsc` 0 errors, 178 lib + 8 picker_state tests pass); manual end-to-end smoke is **pending** because the dev partition (F:) is 100% full.
+- An explicit ask for a maintainer signal before rebasing (mirrors the Step 1 tone on #499).
+
+### Why a new issue, not a comment on #499
+
+#499 is specifically the tree view issue (maintainer-reopened, planned for `v2.0.0-beta.3`). Dialog focus sync is an unrelated feature that the maintainer has not pre-claimed, so it warrants its own issue rather than being parked on #499.
+
+### Expected response window
+
+Apply the Step 2 branches by analogy:
+- 0–2 weeks: maintainer may respond with one of (a) "send PR", (b) "I'll do it myself", (c) wait/silence.
+- 2 weeks: post polite follow-up comment on #547 if no response.
+- 4 weeks: if still silent, default to fork-only self-publishing for this feature (mirror the tree-view Step 2 final branch).
+
+### Next milestones
+
+- **Watch #547 for maintainer signal** — same monitor cadence as #499 (the existing PowerShell monitor script can be adapted / duplicated).
+- **Once feature is verified end-to-end** (after F: free space allows the manual smoke from Task 10), update the issue body to remove the "smoke pending" caveat and link to a verification report.
+- **If maintainer approves**: cherry-pick the dialog-focus-sync commits onto a clean `pr/dialog-focus-sync` branch based on `upstream/main`, drop fork markers, open PR with conventional-commit title (`feat(navigator): keep file dialog in sync with current pane`), reference #547.
+- **If maintainer declines or silent**: stay on fork; treat this spec section as closed.
