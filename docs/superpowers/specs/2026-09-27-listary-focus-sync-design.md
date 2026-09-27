@@ -369,6 +369,35 @@ Spike 完成后必须交付:
 
 ---
 
+## 10. Route Change — Port over Self-Write (2026-09-27)
+
+**Original self-written spike (Tasks 1-14 in old `plans/2026-09-27-listary-focus-sync.md`)**: 19 commits / +3018 LoC. Reset on 2026-09-27 because 7-app matrix verification was structurally infeasible (interactive scripts blocked, only 4/7 apps installed locally, max coverage 57% < 70% threshold).
+
+**New port route** (current `plans/2026-09-27-listary-focus-sync.md`): 11 tasks focused on lifting 3 files (~705 LoC total) from open-source projects that already validate the technique:
+
+| File | Status | Implementation |
+|---|---|---|
+| `src/uia_inject.rs` (176 LoC) | **Port** from `inaku-Gyan/PathWrap/src/os/dialog.rs` (MIT) | UIA `ValuePattern::SetValue` + `InvokePattern::Invoke` + `SendMessageW(WM_KEYDOWN, VK_RETURN)` fallback |
+| `src/uia_event.rs` (399 LoC) | **Port** from `inaku-Gyan/PathWrap/src/os/monitor.rs` (MIT) | `SetWinEventHook` (3 events) + adaptive polling (8/30ms) + lost-tick recovery; **replace `egui::Context` with `tokio::sync::Notify`** |
+| `src/fg_bypass.rs` (129 LoC) | **Port** from `QwenLM/qwen-code/.../fg_bypass.rs` (Apache-2.0) | `EnableWindow(FALSE)` RAII guard during UIA Invoke for Chromium hosts |
+
+**Why port over self-write:**
+- PathWrap uses identical `windows` 0.62 stack — direct compatibility
+- QwenLM `fg_bypass` empirically validated: Chromium 7/8 → 0 z-drops with shield
+- Coverage target 5-7/7 = 70-100% (vs original self-write max 57%)
+- 3.5-4 day ETA vs 8-10 days from scratch
+
+**License obligation:** per-file header preserving MIT/Apache-2.0 attribution. Both licenses permit redistribution with attribution. Spike binary remains internal meta-repo artifact (not pushed to upstream `kizemo/sigma-file-manager`).
+
+**Files modified by route change:**
+- `docs/superpowers/plans/2026-09-27-listary-focus-sync.md` — replaced 14-task self-write with 11-task port
+- `sigma-listary-spike/src/uia_inject.rs`, `uia_event.rs`, `fg_bypass.rs` — new (ported, not self-written)
+- `sigma-listary-spike/src/{config,events,logger,state,tcp_server,detector,reader,writer}.rs` — supporting scaffold (reconstructed from old plan since spike subdir was reset)
+
+**Reference research:** `.other/doc/00-research-overview.md` + `.other/doc/{01..04}-*.md` (4 parallel research agents, 75+ GitHub citations).
+
+---
+
 ## 9. 严禁事项
 
 1. **绝对不要**跳过 spike 直接开始完整实现(违反 brainstorming 共识)
