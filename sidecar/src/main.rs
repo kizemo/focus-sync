@@ -31,6 +31,10 @@ struct Cli {
     /// IPC mode: tcp (legacy, line-JSON) or http (Sigma FM extension).
     #[arg(long, value_enum, default_value_t = IpcMode::Http)]
     ipc: IpcMode,
+    /// Skip UIA monitor + COM init. Useful for CI smoke tests where the runner
+    /// has no real desktop session (no UIAutomationCore).
+    #[arg(long)]
+    no_uia: bool,
 }
 
 #[derive(clap::ValueEnum, Clone, Debug)]
@@ -49,17 +53,13 @@ async fn main() -> Result<()> {
         )
         .try_init();
 
-    // COM init as STA — required for UIA. Must happen before any UIA call.
-    // Safe to call multiple times (subsequent calls return RPC_E_CHANGED_MODE).
-    unsafe {
-        let _ = windows::Win32::System::Com::CoInitializeEx(
-            None,
-            windows::Win32::System::Com::COINIT_APARTMENTTHREADED,
-        );
-    }
-
     let cli = Cli::parse();
-    let cfg = parse_config(cli.port, cli.initial_path.clone(), cli.app_whitelist)?;
+    let cfg = parse_config(
+        cli.port,
+        cli.initial_path.clone(),
+        cli.app_whitelist,
+        cli.no_uia,
+    )?;
 
     log_event(&Event::SidecarError {
         kind: "startup".into(),
@@ -85,13 +85,26 @@ async fn main() -> Result<()> {
 
     // Spawn the UIA monitor (blocking) in a blocking task.
     // start_monitor is `pub fn` (sync); needs spawn_blocking.
-    let sync_tx_clone = sync_tx.clone();
-    tokio::task::spawn_blocking(move || {
-        // The monitor uses `ctx.request_repaint` semantics; in sidecar we just no-op the notify.
-        // For first integration we pass a no-op Arc<tokio::sync::Notify>.
-        let notify = Arc::new(tokio::sync::Notify::new());
-        uia_event::start_monitor(sync_tx_clone, notify);
-    });
+    // Skip when --no-uia (CI smoke tests).
+    if !cfg.no_uia {
+        // COM init as STA — required for UIA. Must happen before any UIA call.
+        // Safe to call multiple times (subsequent calls return RPC_E_CHANGED_MODE).
+        unsafe {
+            let _ = windows::Win32::System::Com::CoInitializeEx(
+                None,
+                windows::Win32::System::Com::COINIT_APARTMENTTHREADED,
+            );
+        }
+        let sync_tx_clone = sync_tx.clone();
+        tokio::task::spawn_blocking(move || {
+            // The monitor uses `ctx.request_repaint` semantics; in sidecar we just no-op the notify.
+            // For first integration we pass a no-op Arc<tokio::sync::Notify>.
+            let notify = Arc::new(tokio::sync::Notify::new());
+            uia_event::start_monitor(sync_tx_clone, notify);
+        });
+    } else {
+        tracing::warn!("UIA monitor disabled (--no-uia); sidecar runs HTTP server only");
+    }
 
     // Spawn IPC server (TCP legacy OR HTTP for Sigma FM extension).
     let state_for_ipc = state.clone();

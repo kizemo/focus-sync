@@ -9,6 +9,9 @@ pub struct Config {
     pub port: u16,
     pub initial_path: String,
     pub app_whitelist: Vec<String>,
+    /// When true, skip UIA monitor + COM init. Used for CI smoke tests where
+    /// Windows Server runners may lack a real desktop session.
+    pub no_uia: bool,
 }
 
 /// Try to bind to `preferred`, then `preferred+1`, ..., up to `preferred+78`.
@@ -35,12 +38,14 @@ pub fn parse_config(
     port: u16,
     initial_path: String,
     app_whitelist: Vec<String>,
+    no_uia: bool,
 ) -> Result<Config> {
     let port = resolve_port(port)?;
     Ok(Config {
         port,
         initial_path,
         app_whitelist,
+        no_uia,
     })
 }
 
@@ -67,9 +72,10 @@ mod tests {
 
     #[test]
     fn parse_config_returns_resolved_port() {
-        let cfg = parse_config(37421, "C:\\Users\\foo".into(), vec![]).unwrap();
+        let cfg = parse_config(37421, "C:\\Users\\foo".into(), vec![], false).unwrap();
         assert_eq!(cfg.initial_path, "C:\\Users\\foo");
         assert!(cfg.port >= 37421);
         assert!(cfg.app_whitelist.is_empty());
+        assert!(!cfg.no_uia);
     }
 }
