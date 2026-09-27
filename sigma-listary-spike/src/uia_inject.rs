@@ -55,7 +55,7 @@ pub fn inject_folder_path(dialog_hwnd: u32, target_path: &str) {
 
 /// Reuse the main-thread `IUIAutomation` instance (COM interfaces are `!Send`,
 /// thread-local fits the constraint perfectly).
-fn automation() -> Option<IUIAutomation> {
+pub fn automation() -> Option<IUIAutomation> {
     thread_local! {
         static INSTANCE: RefCell<Option<IUIAutomation>> = const { RefCell::new(None) };
     }
