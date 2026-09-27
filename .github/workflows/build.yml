@@ -110,85 +110,89 @@ jobs:
           name: spike-windows-x64
           path: spike/
 
-      - name: Start spike (HTTP mode)
+      # NOTE: GitHub Actions does NOT preserve background processes across
+      # step boundaries by default — each `run:` runs in a fresh process tree
+      # and child processes are reaped. All spike interactions MUST happen
+      # in a single step. This test: start spike, poll /health, exercise
+      # all endpoints, quit, cleanup — all in one PowerShell invocation.
+      - name: Smoke test spike HTTP (single step)
         shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
           $spike = "spike\spike.exe"
-          # --no-uia: skip UIA monitor + COM init. CI Windows Server runners
-          # have no desktop session and no UIAutomationCore, so the monitor
-          # would otherwise panic and tear down the process.
+          $port = 37422
+          $logOut = "spike.out.log"
+          $logErr = "spike.err.log"
+
+          # Launch spike with --no-uia (CI runners have no UIAutomationCore).
           $proc = Start-Process -FilePath $spike `
-            -ArgumentList "--ipc", "http", "--port", "37422", "--no-uia" `
+            -ArgumentList "--ipc", "http", "--port", $port, "--no-uia" `
             -PassThru -NoNewWindow `
-            -RedirectStandardOutput spike.out.log `
-            -RedirectStandardError spike.err.log
-          # Poll /health up to 30s (COM init + UIA monitor + HTTP bind can be slow on CI runners).
-          $ready = $false
-          for ($i = 1; $i -le 30; $i++) {
+            -RedirectStandardOutput $logOut `
+            -RedirectStandardError $logErr
+          Write-Host "spike launched PID=$($proc.Id)"
+
+          try {
+            # Poll /health up to 30s.
+            $ready = $false
+            for ($i = 1; $i -le 30; $i++) {
+              try {
+                $r = Invoke-WebRequest -Uri "http://127.0.0.1:${port}/health" `
+                  -UseBasicParsing -TimeoutSec 2 -ErrorAction Stop
+                if ($r.StatusCode -eq 200) {
+                  Write-Host "spike ready after ${i}s"
+                  $ready = $true
+                  break
+                }
+              } catch { }
+              Start-Sleep -Seconds 1
+            }
+            if (-not $ready) { throw "spike did not become ready within 30s" }
+
+            # 1. Re-verify /health.
+            $r = Invoke-WebRequest -Uri "http://127.0.0.1:${port}/health" -UseBasicParsing
+            if ($r.StatusCode -ne 200) { throw "health failed: $($r.StatusCode)" }
+            $body = $r.Content | ConvertFrom-Json
+            if (-not $body.ok) { throw "health body invalid" }
+            Write-Host "[1] health OK: $($body | ConvertTo-Json -Compress)"
+
+            # 2. POST /set_path.
+            $payload = @{ path = "C:\Users\Public" } | ConvertTo-Json -Compress
+            $r = Invoke-WebRequest -Uri "http://127.0.0.1:${port}/set_path" `
+              -Method POST -Body $payload -ContentType "application/json" -UseBasicParsing
+            if ($r.StatusCode -ne 200) { throw "set_path failed: $($r.StatusCode)" }
+            Write-Host "[2] set_path OK"
+
+            # 3. GET /get_status (verify path was stored).
+            $r = Invoke-WebRequest -Uri "http://127.0.0.1:${port}/get_status" -UseBasicParsing
+            $body = $r.Content | ConvertFrom-Json
+            if ($body.current_path -ne "C:\Users\Public") {
+              throw "expected current_path=C:\Users\Public, got $($body.current_path)"
+            }
+            Write-Host "[3] get_status OK: current_path=$($body.current_path) active_dialogs=$($body.active_dialogs)"
+
+            # 4. POST /quit (graceful shutdown).
             try {
-              $r = Invoke-WebRequest -Uri "http://127.0.0.1:37422/health" `
-                -UseBasicParsing -TimeoutSec 2 -ErrorAction Stop
-              if ($r.StatusCode -eq 200) {
-                Write-Host "spike ready after ${i}s"
-                $ready = $true
-                break
-              }
+              $null = Invoke-WebRequest -Uri "http://127.0.0.1:${port}/quit" `
+                -Method POST -UseBasicParsing -TimeoutSec 2
             } catch {
-              # Not ready yet, keep polling
+              Write-Host "[4] quit closed connection (expected)"
             }
             Start-Sleep -Seconds 1
+
+            Write-Host "ALL CHECKS PASSED"
           }
-          if (-not $ready) {
+          catch {
             Write-Host "=== spike.out.log ==="
-            if (Test-Path spike.out.log) { Get-Content spike.out.log }
+            if (Test-Path $logOut) { Get-Content $logOut }
             Write-Host "=== spike.err.log ==="
-            if (Test-Path spike.err.log) { Get-Content spike.err.log }
+            if (Test-Path $logErr) { Get-Content $logErr }
+            throw
+          }
+          finally {
             $procs = Get-Process -Name spike -ErrorAction SilentlyContinue
             if ($procs) {
-              Write-Host "spike PIDs: $($procs.Id -join ', ')"
+              Write-Host "cleanup: killing spike PIDs $($procs.Id -join ', ')"
               $procs | Stop-Process -Force
             }
-            throw "spike did not become ready within 30s"
-          }
-
-      - name: Hit /health (re-verify)
-        shell: pwsh
-        run: |
-          $r = Invoke-WebRequest -Uri "http://127.0.0.1:37422/health" -UseBasicParsing
-          if ($r.StatusCode -ne 200) { throw "health failed: $($r.StatusCode)" }
-          $body = $r.Content | ConvertFrom-Json
-          if (-not $body.ok) { throw "health body invalid" }
-          Write-Host "health OK: $($body | ConvertTo-Json)"
-
-      - name: POST /set_path
-        shell: pwsh
-        run: |
-          $body = @{ path = "C:\Users\Public" } | ConvertTo-Json
-          $r = Invoke-WebRequest -Uri "http://127.0.0.1:37422/set_path" `
-            -Method POST -Body $body -ContentType "application/json" -UseBasicParsing
-          if ($r.StatusCode -ne 200) { throw "set_path failed: $($r.StatusCode)" }
-          Write-Host "set_path OK"
-
-      - name: GET /get_status
-        shell: pwsh
-        run: |
-          $r = Invoke-WebRequest -Uri "http://127.0.0.1:37422/get_status" -UseBasicParsing
-          $body = $r.Content | ConvertFrom-Json
-          if ($body.current_path -ne "C:\Users\Public") {
-            throw "expected current_path=C:\Users\Public, got $($body.current_path)"
-          }
-          Write-Host "get_status OK: $($body | ConvertTo-Json)"
-
-      - name: POST /quit (cleanup)
-        shell: pwsh
-        run: |
-          try {
-            $r = Invoke-WebRequest -Uri "http://127.0.0.1:37422/quit" `
-              -Method POST -UseBasicParsing -TimeoutSec 2
-          } catch { Write-Host "quit closed connection (expected)" }
-          Start-Sleep -Seconds 1
-          $procs = Get-Process -Name spike -ErrorAction SilentlyContinue
-          if ($procs) {
-            Write-Host "spike still running, killing"
-            $procs | Stop-Process -Force
           }
