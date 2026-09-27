@@ -1,0 +1,39 @@
+# Rust / Cargo (spike/)
+/spike/target/
+/spike/Cargo.lock.bak
+
+# Node / TypeScript (extension/)
+/extension/dist/
+/extension/node_modules/
+/extension/.tsbuildinfo
+/extension/*.tsbuildinfo
+/extension/coverage/
+/extension/.nyc_output/
+
+# Logs and temp files
+*.log
+*.err
+.env
+.env.local
+
+# Editor / OS
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# GitHub Actions
+.github/workflows/local-act/
+
+# Spike smoke test artifacts (created by integration test)
+/spike/spike.out.log
+/spike/spike.err.log
+
+# Build artifacts in spike (when running locally)
+/spike/dist/
+
+# Local config overrides (e.g. for testing)
+/spike/override.toml

@@ -1,0 +1,149 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  spike:
+    name: Build spike.exe (Windows x64)
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: spike
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: |
+          rustup default stable
+          rustup target add x86_64-pc-windows-msvc
+
+      - name: Build spike (release)
+        run: cargo build --release --locked
+
+      - name: Verify spike.exe
+        shell: pwsh
+        run: |
+          $exe = "target\release\spike.exe"
+          if (-not (Test-Path $exe)) { throw "spike.exe not found" }
+          $size = (Get-Item $exe).Length
+          Write-Host "spike.exe size: $size bytes"
+          if ($size -lt 1MB) { throw "spike.exe suspiciously small" }
+
+      - name: Run unit tests
+        run: cargo test --lib --locked
+
+      - name: Upload spike.exe artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: spike-windows-x64
+          path: spike/target/release/spike.exe
+          if-no-files-found: error
+
+  extension:
+    name: Build extension (TS bundle)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: extension
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: extension/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci || npm install
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Build extension bundle
+        run: npm run build
+
+      - name: Verify dist/index.js exists
+        run: |
+          if [ ! -f dist/index.js ]; then
+            echo "ERROR: dist/index.js missing"
+            exit 1
+          fi
+          echo "Built dist/index.js:"
+          ls -la dist/
+
+      - name: Upload extension bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: extension-dist
+          path: extension/dist/
+          if-no-files-found: error
+
+  integration:
+    name: Smoke test spike HTTP mode
+    runs-on: windows-latest
+    needs: spike
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download spike.exe
+        uses: actions/download-artifact@v4
+        with:
+          name: spike-windows-x64
+          path: spike/
+
+      - name: Start spike (HTTP mode)
+        shell: pwsh
+        run: |
+          $spike = "spike\spike.exe"
+          $proc = Start-Process -FilePath $spike `
+            -ArgumentList "--ipc", "http", "--port", "37422" `
+            -PassThru -NoNewWindow `
+            -RedirectStandardOutput spike.out.log `
+            -RedirectStandardError spike.err.log
+          Start-Sleep -Seconds 3
+
+      - name: Hit /health
+        shell: pwsh
+        run: |
+          $r = Invoke-WebRequest -Uri "http://127.0.0.1:37422/health" -UseBasicParsing
+          if ($r.StatusCode -ne 200) { throw "health failed: $($r.StatusCode)" }
+          $body = $r.Content | ConvertFrom-Json
+          if (-not $body.ok) { throw "health body invalid" }
+          Write-Host "health OK: $($body | ConvertTo-Json)"
+
+      - name: POST /set_path
+        shell: pwsh
+        run: |
+          $body = @{ path = "C:\Users\Public" } | ConvertTo-Json
+          $r = Invoke-WebRequest -Uri "http://127.0.0.1:37422/set_path" `
+            -Method POST -Body $body -ContentType "application/json" -UseBasicParsing
+          if ($r.StatusCode -ne 200) { throw "set_path failed" }
+
+      - name: GET /get_status
+        shell: pwsh
+        run: |
+          $r = Invoke-WebRequest -Uri "http://127.0.0.1:37422/get_status" -UseBasicParsing
+          $body = $r.Content | ConvertFrom-Json
+          if ($body.current_path -ne "C:\Users\Public") {
+            throw "expected current_path=C:\Users\Public, got $($body.current_path)"
+          }
+
+      - name: POST /quit (cleanup)
+        shell: pwsh
+        run: |
+          try {
+            $r = Invoke-WebRequest -Uri "http://127.0.0.1:37422/quit" `
+              -Method POST -UseBasicParsing -TimeoutSec 2
+          } catch { Write-Host "quit closed connection (expected)" }
+          Start-Sleep -Seconds 1
+          $procs = Get-Process -Name spike -ErrorAction SilentlyContinue
+          if ($procs) {
+            Write-Host "spike still running, killing"
+            $procs | Stop-Process -Force
+          }
