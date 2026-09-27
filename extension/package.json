@@ -1,7 +1,7 @@
 {
   "id": "kizemo.focus-sync",
   "name": "Focus Sync",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Listary-style global focus sync. Any Windows app's file dialog auto-jumps to Sigma's current folder.",
   "publisher": {
     "name": "kizemo",
@@ -34,10 +34,10 @@
   ],
   "binaries": [
     {
-      "id": "spike",
-      "name": "Focus Sync Spike",
-      "version": "0.1.0",
-      "executable": "spike.exe",
+      "id": "focus-sync-sidecar",
+      "name": "Focus Sync Sidecar",
+      "version": "0.2.0",
+      "executable": "focus-sync-sidecar.exe",
       "repository": "https://github.com/kizemo/focus-sync",
       "platforms": [
         "windows"
@@ -48,10 +48,10 @@
           "arch": [
             "x64"
           ],
-          "downloadUrl": "https://github.com/kizemo/focus-sync/releases/download/v0.1.0/spike-windows-x64.zip",
+          "downloadUrl": "https://github.com/kizemo/focus-sync/releases/download/v0.2.0/focus-sync-sidecar-windows-x64.zip",
           "integrity": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
           "archive": true,
-          "executable": "spike.exe"
+          "executable": "focus-sync-sidecar.exe"
         }
       ]
     }
@@ -67,7 +67,7 @@
       {
         "id": "focus-sync.toggle",
         "title": "Focus Sync — Enable / Disable",
-        "description": "Toggle focus sync on/off (spike stays running but stops pushing paths when disabled)",
+        "description": "Toggle focus sync on/off (sidecar stays running but stops pushing paths when disabled)",
         "icon": "mdi-pause-circle"
       }
     ],

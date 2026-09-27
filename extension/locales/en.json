@@ -9,7 +9,7 @@
   "notification.synced": "Synced: {{path}}",
   "notification.enabled": "Focus sync enabled",
   "notification.disabled": "Focus sync disabled",
-  "notification.binaryMissing": "spike binary not installed. Reinstall the extension.",
-  "notification.spawnFailed": "Failed to start spike: {{error}}",
+  "notification.binaryMissing": "Sidecar binary not installed. Reinstall the extension.",
+  "notification.spawnFailed": "Failed to start sidecar: {{error}}",
   "notification.noCurrentPath": "No current path in Sigma navigator."
 }

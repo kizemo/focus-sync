@@ -8,12 +8,12 @@ on:
   workflow_dispatch:
 
 jobs:
-  spike:
-    name: Build spike.exe (Windows x64)
+  sidecar:
+    name: Build focus-sync-sidecar.exe (Windows x64)
     runs-on: windows-latest
     defaults:
       run:
-        working-directory: spike
+        working-directory: sidecar
     steps:
       - uses: actions/checkout@v4
 
@@ -22,19 +22,19 @@ jobs:
           rustup default stable
           rustup target add x86_64-pc-windows-msvc
 
-      - name: Build spike (release)
+      - name: Build sidecar (release)
         # NOTE: --locked removed temporarily to regen Cargo.lock after adding axum dep.
         # After this run commits a fresh Cargo.lock, re-add --locked.
         run: cargo build --release
 
-      - name: Verify spike.exe
+      - name: Verify sidecar binary
         shell: pwsh
         run: |
-          $exe = "target\release\spike.exe"
-          if (-not (Test-Path $exe)) { throw "spike.exe not found" }
+          $exe = "target\release\focus-sync-sidecar.exe"
+          if (-not (Test-Path $exe)) { throw "focus-sync-sidecar.exe not found" }
           $size = (Get-Item $exe).Length
-          Write-Host "spike.exe size: $size bytes"
-          if ($size -lt 1MB) { throw "spike.exe suspiciously small" }
+          Write-Host "focus-sync-sidecar.exe size: $size bytes"
+          if ($size -lt 1MB) { throw "focus-sync-sidecar.exe suspiciously small" }
 
       - name: Run unit tests
         # NOTE: --locked removed temporarily to match build step.
@@ -46,15 +46,15 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: spike-cargo-lock
-          path: spike/Cargo.lock
+          name: sidecar-cargo-lock
+          path: sidecar/Cargo.lock
           if-no-files-found: ignore
 
-      - name: Upload spike.exe artifact
+      - name: Upload sidecar binary artifact
         uses: actions/upload-artifact@v4
         with:
-          name: spike-windows-x64
-          path: spike/target/release/spike.exe
+          name: focus-sync-sidecar-windows-x64
+          path: sidecar/target/release/focus-sync-sidecar.exe
           if-no-files-found: error
 
   extension:
@@ -98,39 +98,39 @@ jobs:
           if-no-files-found: error
 
   integration:
-    name: Smoke test spike HTTP mode
+    name: Smoke test sidecar HTTP mode
     runs-on: windows-latest
-    needs: spike
+    needs: sidecar
     steps:
       - uses: actions/checkout@v4
 
-      - name: Download spike.exe
+      - name: Download sidecar binary
         uses: actions/download-artifact@v4
         with:
-          name: spike-windows-x64
-          path: spike/
+          name: focus-sync-sidecar-windows-x64
+          path: sidecar/
 
       # NOTE: GitHub Actions does NOT preserve background processes across
       # step boundaries by default — each `run:` runs in a fresh process tree
-      # and child processes are reaped. All spike interactions MUST happen
-      # in a single step. This test: start spike, poll /health, exercise
+      # and child processes are reaped. All sidecar interactions MUST happen
+      # in a single step. This test: start sidecar, poll /health, exercise
       # all endpoints, quit, cleanup — all in one PowerShell invocation.
-      - name: Smoke test spike HTTP (single step)
+      - name: Smoke test sidecar HTTP (single step)
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          $spike = "spike\spike.exe"
+          $sidecar = "sidecar\focus-sync-sidecar.exe"
           $port = 37422
-          $logOut = "spike.out.log"
-          $logErr = "spike.err.log"
+          $logOut = "sidecar.out.log"
+          $logErr = "sidecar.err.log"
 
-          # Launch spike with --no-uia (CI runners have no UIAutomationCore).
-          $proc = Start-Process -FilePath $spike `
+          # Launch sidecar with --no-uia (CI runners have no UIAutomationCore).
+          $proc = Start-Process -FilePath $sidecar `
             -ArgumentList "--ipc", "http", "--port", $port, "--no-uia" `
             -PassThru -NoNewWindow `
             -RedirectStandardOutput $logOut `
             -RedirectStandardError $logErr
-          Write-Host "spike launched PID=$($proc.Id)"
+          Write-Host "sidecar launched PID=$($proc.Id)"
 
           try {
             # Poll /health up to 30s.
@@ -140,14 +140,14 @@ jobs:
                 $r = Invoke-WebRequest -Uri "http://127.0.0.1:${port}/health" `
                   -UseBasicParsing -TimeoutSec 2 -ErrorAction Stop
                 if ($r.StatusCode -eq 200) {
-                  Write-Host "spike ready after ${i}s"
+                  Write-Host "sidecar ready after ${i}s"
                   $ready = $true
                   break
                 }
               } catch { }
               Start-Sleep -Seconds 1
             }
-            if (-not $ready) { throw "spike did not become ready within 30s" }
+            if (-not $ready) { throw "sidecar did not become ready within 30s" }
 
             # 1. Re-verify /health.
             $r = Invoke-WebRequest -Uri "http://127.0.0.1:${port}/health" -UseBasicParsing
@@ -183,16 +183,16 @@ jobs:
             Write-Host "ALL CHECKS PASSED"
           }
           catch {
-            Write-Host "=== spike.out.log ==="
+            Write-Host "=== sidecar.out.log ==="
             if (Test-Path $logOut) { Get-Content $logOut }
-            Write-Host "=== spike.err.log ==="
+            Write-Host "=== sidecar.err.log ==="
             if (Test-Path $logErr) { Get-Content $logErr }
             throw
           }
           finally {
-            $procs = Get-Process -Name spike -ErrorAction SilentlyContinue
+            $procs = Get-Process -Name focus-sync-sidecar -ErrorAction SilentlyContinue
             if ($procs) {
-              Write-Host "cleanup: killing spike PIDs $($procs.Id -join ', ')"
+              Write-Host "cleanup: killing sidecar PIDs $($procs.Id -join ', ')"
               $procs | Stop-Process -Force
             }
           }

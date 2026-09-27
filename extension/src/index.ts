@@ -3,22 +3,37 @@
  *
  * Lifecycle:
  * - `activate` runs on `onStartup` (every Sigma launch with this extension enabled).
- * - Spawns `spike.exe` as a long-running background task (host tracks per extension).
- * - Subscribes to Sigma's current path changes and pushes them to spike.
- * - Spike translates paths to UIA dialog writes (Windows file dialogs).
+ * - Spawns the `focus-sync-sidecar.exe` binary as a long-running background
+ *   task (host tracks per extension; see
+ *   sigma-file-manager/src-tauri/src/extensions/processes.rs).
+ * - Subscribes to Sigma's current path changes and pushes them via HTTP to
+ *   the sidecar, which translates them into Windows UI Automation writes
+ *   against any foreground file dialog.
+ *
+ * Why a sidecar binary is required:
+ * - Sigma FM extensions run in a sandboxed JS / webview context. They cannot
+ *   open raw TCP sockets or call Windows COM APIs directly.
+ * - Windows UI Automation needs COM STA + UIAutomationCore. Only a native
+ *   Win32 process can do that. Hence the sidecar binary handles the actual
+ *   HWND / ValuePattern / Invoke work; the extension orchestrates.
  *
  * Design notes:
  * - IPC is HTTP, not TCP, because Sigma FM extensions can declare `http` host
  *   permission in the manifest but cannot open raw TCP sockets from a web worker.
- * - Spike serves HTTP on `127.0.0.1:37421` (loopback only, no firewall prompt).
+ * - The sidecar serves HTTP on `127.0.0.1:37421` (loopback only, no firewall prompt).
  * - `sigma.shell.runWithProgress` returns a cancel handle the host uses to
- *   terminate spike on extension deactivation / Sigma exit
- *   (see `sigma-file-manager/src-tauri/src/extensions/processes.rs`).
+ *   terminate the sidecar on extension deactivation / Sigma exit.
  *
  * Source attribution:
- * - `spike.exe` Rust source under `../spike/` (MIT, with Apache-2.0 fg_bypass.rs)
- *   — ported from `inaku-Gyan/PathWrap` (MIT) + `QwenLM/qwen-code` (Apache-2.0)
- *   during spike phase. See `../spike/README.md`.
+ * - The sidecar Rust source lives under `../sidecar/` (MIT, with Apache-2.0 for
+ *   `fg_bypass.rs` — ported from `inaku-Gyan/PathWrap` (MIT) and
+ *   `QwenLM/qwen-code` (Apache-2.0). See `../sidecar/README.md`.
+ *
+ * Naming history:
+ * - The sidecar was originally called `spike.exe` during an internal research
+ *   spike phase. As of v0.2.0 it has been renamed to `focus-sync-sidecar.exe`
+ *   for clarity — same code, cleaner name. (The 'spike' name itself came from
+ *   'S'idecar 'P'rocess for 'I'ntegration 'K'nowledge 'E'xtension.)
  */
 
 import type {
@@ -26,23 +41,23 @@ import type {
   ExtensionModule,
 } from '@sigma-file-manager/api';
 
-const SPIKE_BINARY_ID = 'spike';
-const SPIKE_HTTP = 'http://127.0.0.1:37421';
-const SPIKE_DEFAULT_PORT = 37421;
+const SIDECAR_BINARY_ID = 'focus-sync-sidecar';
+const SIDECAR_HTTP = 'http://127.0.0.1:37421';
+const SIDECAR_DEFAULT_PORT = 37421;
 
-interface SpikeRuntime {
+interface SidecarRuntime {
   taskId: string;
   cancel: () => Promise<void>;
   port: number;
 }
 
-let spike: SpikeRuntime | null = null;
+let sidecar: SidecarRuntime | null = null;
 let enabled = true;
 let currentPath: string | null = null;
 let pushTimer: number | null = null;
 
 /**
- * Push Sigma's current path to spike (HTTP POST /set_path).
+ * Push Sigma's current path to the sidecar (HTTP POST /set_path).
  * Debounced 100ms to coalesce rapid navigation.
  */
 function schedulePush(path: string): void {
@@ -57,16 +72,16 @@ function schedulePush(path: string): void {
 }
 
 async function pushNow(path: string): Promise<void> {
-  if (!enabled || !spike) return;
+  if (!enabled || !sidecar) return;
   try {
     await sigma.http.request({
-      url: `${SPIKE_HTTP}/set_path`,
+      url: `${SIDECAR_HTTP}/set_path`,
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ path }),
     });
   } catch (e) {
-    // spike down or unreachable — log silently. Next activate will respawn.
+    // Sidecar down or unreachable — log silently. Next activate will respawn.
     console.warn('[focus-sync] push failed:', e);
   }
 }
@@ -108,43 +123,43 @@ export const activate: ExtensionModule['activate'] = async (
   // 2. Restore persisted toggle state.
   enabled = (await sigma.storage.get<boolean>('enabled')) ?? true;
 
-  // 3. Verify spike binary is installed (host manages downloads + integrity).
-  const spikePath = await sigma.binary.getPath(SPIKE_BINARY_ID);
-  if (!spikePath) {
+  // 3. Verify sidecar binary is installed (host manages downloads + integrity).
+  const sidecarPath = await sigma.binary.getPath(SIDECAR_BINARY_ID);
+  if (!sidecarPath) {
     sigma.ui.showNotification({
       title: 'Focus Sync',
       description:
-        'spike binary not installed. Open Extensions → Focus Sync → Install Binary.',
+        'Sidecar binary not installed. Open Extensions → Focus Sync → Install Binary.',
       type: 'error',
       duration: 8000,
     });
     return;
   }
 
-  // 4. Spawn spike as long-running background task.
+  // 4. Spawn the sidecar as a long-running background task.
   //    `runWithProgress` returns a cancel handle the host uses on deactivate.
   try {
     const task = await sigma.shell.runWithProgress(
-      spikePath,
-      ['--ipc', 'http', '--port', String(SPIKE_DEFAULT_PORT)],
-      // onProgress: surface spike stderr to extension logs.
+      sidecarPath,
+      ['--ipc', 'http', '--port', String(SIDECAR_DEFAULT_PORT)],
+      // onProgress: surface sidecar stderr to extension logs.
       ({ line, isStderr }) => {
         if (isStderr) {
-          console.warn('[focus-sync][spike]', line);
+          console.warn('[focus-sync][sidecar]', line);
         } else {
-          console.log('[focus-sync][spike]', line);
+          console.log('[focus-sync][sidecar]', line);
         }
       }
     );
-    spike = {
+    sidecar = {
       taskId: task.taskId,
       cancel: task.cancel,
-      port: SPIKE_DEFAULT_PORT,
+      port: SIDECAR_DEFAULT_PORT,
     };
   } catch (e) {
     sigma.ui.showNotification({
       title: 'Focus Sync',
-      description: `Failed to start spike: ${String(e)}`,
+      description: `Failed to start sidecar: ${String(e)}`,
       type: 'error',
     });
     return;
@@ -190,7 +205,7 @@ export const activate: ExtensionModule['activate'] = async (
     schedulePush(initialPath);
   }
 
-  console.log(`[focus-sync] activated, spike pid task=${spike.taskId}`);
+  console.log(`[focus-sync] activated, sidecar task=${sidecar.taskId}`);
 };
 
 export const deactivate: ExtensionModule['deactivate'] = async () => {
@@ -198,22 +213,22 @@ export const deactivate: ExtensionModule['deactivate'] = async () => {
     clearTimeout(pushTimer);
     pushTimer = null;
   }
-  if (spike) {
+  if (sidecar) {
     try {
-      // Politely ask spike to quit (graceful, exits after HTTP response).
+      // Politely ask the sidecar to quit (graceful, exits after HTTP response).
       await sigma.http.request({
-        url: `${SPIKE_HTTP}/quit`,
+        url: `${SIDECAR_HTTP}/quit`,
         method: 'POST',
       });
     } catch {
-      // spike may already be down — that's fine.
+      // sidecar may already be down — that's fine.
     }
     try {
-      await spike.cancel();
+      await sidecar.cancel();
     } catch {
       // host may have already terminated the process tree.
     }
-    spike = null;
+    sidecar = null;
   }
   console.log('[focus-sync] deactivated');
 };

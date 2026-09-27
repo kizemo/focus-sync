@@ -1,0 +1,41 @@
+[package]
+name = "focus-sync-sidecar"
+version = "0.2.0"
+edition = "2021"
+publish = false
+description = "Focus Sync sidecar binary — Windows UI Automation daemon. Companion to the kizemo.focus-sync Sigma FM extension. Port lineage: PathWrap + QwenLM fg_bypass."
+
+[lib]
+name = "sidecar"
+path = "src/lib.rs"
+
+[[bin]]
+name = "focus-sync-sidecar"
+path = "src/main.rs"
+
+[dependencies]
+windows = { version = "0.62", features = [
+  "Win32_Foundation",
+  "Win32_Graphics_Dwm",
+  "Win32_System_Com",
+  "Win32_System_LibraryLoader",
+  "Win32_System_Threading",
+  "Win32_UI_HiDpi",
+  "Win32_UI_Accessibility",
+  "Win32_UI_WindowsAndMessaging",
+  "Win32_UI_Input_KeyboardAndMouse",
+] }
+tokio = { version = "1", features = ["net", "io-util", "macros", "rt-multi-thread", "sync", "time", "signal"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+clap = { version = "4", features = ["derive"] }
+axum = "0.7"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true

@@ -25,12 +25,12 @@ SOFTWARE.
 This project incorporates source code from the following open-source projects:
 
 1. inaku-Gyan/PathWrap (https://github.com/inaku-Gyan/PathWrap)
-   - Files: spike/src/uia_inject.rs (derived from src/os/dialog.rs)
-            spike/src/uia_event.rs  (derived from src/os/monitor.rs)
+   - Files: sidecar/src/uia_inject.rs (derived from src/os/dialog.rs)
+            sidecar/src/uia_event.rs  (derived from src/os/monitor.rs)
    - License: MIT (see https://github.com/inaku-Gyan/PathWrap/blob/main/LICENSE)
 
 2. QwenLM/qwen-code (https://github.com/QwenLM/qwen-code)
-   - Files: spike/src/fg_bypass.rs (derived from packages/cua-driver/rust/crates/platform-windows/src/uia/fg_bypass.rs)
+   - Files: sidecar/src/fg_bypass.rs (derived from packages/cua-driver/rust/crates/platform-windows/src/uia/fg_bypass.rs)
    - License: Apache-2.0 (see https://github.com/QwenLM/qwen-code/blob/main/LICENSE)
 
 License headers are preserved at the top of each ported file.

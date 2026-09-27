@@ -1,6 +1,6 @@
-# Rust / Cargo (spike/)
+# Rust / Cargo (sidecar/)
 /spike/target/
-/spike/Cargo.lock.bak
+/sidecar/Cargo.lock.bak
 
 # Node / TypeScript (extension/)
 /extension/dist/
@@ -28,12 +28,12 @@ Thumbs.db
 # GitHub Actions
 .github/workflows/local-act/
 
-# Spike smoke test artifacts (created by integration test)
-/spike/spike.out.log
-/spike/spike.err.log
+# Sidecar smoke test artifacts (created by integration test)
+/sidecar/sidecar.out.log
+/sidecar/sidecar.err.log
 
-# Build artifacts in spike (when running locally)
+# Build artifacts in sidecar (when running locally)
 /spike/dist/
 
 # Local config overrides (e.g. for testing)
-/spike/override.toml
+/sidecar/override.toml
