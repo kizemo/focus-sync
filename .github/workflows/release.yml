@@ -28,7 +28,9 @@ jobs:
 
       - name: Build spike.exe
         working-directory: spike
-        run: cargo build --release --locked
+        # NOTE: --locked removed temporarily to regen Cargo.lock after adding axum dep.
+        # After this run commits a fresh Cargo.lock, re-add --locked.
+        run: cargo build --release
 
       - name: Zip spike.exe
         shell: pwsh
