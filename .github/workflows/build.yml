@@ -40,6 +40,16 @@ jobs:
         # NOTE: --locked removed temporarily to match build step.
         run: cargo test --lib
 
+      - name: Upload regenerated Cargo.lock
+        # While --locked is temporarily removed, upload the lock file so a human
+        # can download + commit the new version, then re-add --locked.
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: spike-cargo-lock
+          path: spike/Cargo.lock
+          if-no-files-found: ignore
+
       - name: Upload spike.exe artifact
         uses: actions/upload-artifact@v4
         with:
@@ -59,11 +69,11 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '20'
-          cache: 'npm'
-          cache-dependency-path: extension/package-lock.json
 
       - name: Install dependencies
-        run: npm ci || npm install
+        # No cache-dependency-path because package-lock.json is not yet committed
+        # (run `npm install` locally and commit it for reproducible CI).
+        run: npm install
 
       - name: Typecheck
         run: npm run typecheck
@@ -109,9 +119,36 @@ jobs:
             -PassThru -NoNewWindow `
             -RedirectStandardOutput spike.out.log `
             -RedirectStandardError spike.err.log
-          Start-Sleep -Seconds 3
+          # Poll /health up to 30s (COM init + UIA monitor + HTTP bind can be slow on CI runners).
+          $ready = $false
+          for ($i = 1; $i -le 30; $i++) {
+            try {
+              $r = Invoke-WebRequest -Uri "http://127.0.0.1:37422/health" `
+                -UseBasicParsing -TimeoutSec 2 -ErrorAction Stop
+              if ($r.StatusCode -eq 200) {
+                Write-Host "spike ready after ${i}s"
+                $ready = $true
+                break
+              }
+            } catch {
+              # Not ready yet, keep polling
+            }
+            Start-Sleep -Seconds 1
+          }
+          if (-not $ready) {
+            Write-Host "=== spike.out.log ==="
+            if (Test-Path spike.out.log) { Get-Content spike.out.log }
+            Write-Host "=== spike.err.log ==="
+            if (Test-Path spike.err.log) { Get-Content spike.err.log }
+            $procs = Get-Process -Name spike -ErrorAction SilentlyContinue
+            if ($procs) {
+              Write-Host "spike PIDs: $($procs.Id -join ', ')"
+              $procs | Stop-Process -Force
+            }
+            throw "spike did not become ready within 30s"
+          }
 
-      - name: Hit /health
+      - name: Hit /health (re-verify)
         shell: pwsh
         run: |
           $r = Invoke-WebRequest -Uri "http://127.0.0.1:37422/health" -UseBasicParsing
@@ -126,7 +163,8 @@ jobs:
           $body = @{ path = "C:\Users\Public" } | ConvertTo-Json
           $r = Invoke-WebRequest -Uri "http://127.0.0.1:37422/set_path" `
             -Method POST -Body $body -ContentType "application/json" -UseBasicParsing
-          if ($r.StatusCode -ne 200) { throw "set_path failed" }
+          if ($r.StatusCode -ne 200) { throw "set_path failed: $($r.StatusCode)" }
+          Write-Host "set_path OK"
 
       - name: GET /get_status
         shell: pwsh
@@ -136,6 +174,7 @@ jobs:
           if ($body.current_path -ne "C:\Users\Public") {
             throw "expected current_path=C:\Users\Public, got $($body.current_path)"
           }
+          Write-Host "get_status OK: $($body | ConvertTo-Json)"
 
       - name: POST /quit (cleanup)
         shell: pwsh
