@@ -114,8 +114,11 @@ jobs:
         shell: pwsh
         run: |
           $spike = "spike\spike.exe"
+          # --no-uia: skip UIA monitor + COM init. CI Windows Server runners
+          # have no desktop session and no UIAutomationCore, so the monitor
+          # would otherwise panic and tear down the process.
           $proc = Start-Process -FilePath $spike `
-            -ArgumentList "--ipc", "http", "--port", "37422" `
+            -ArgumentList "--ipc", "http", "--port", "37422", "--no-uia" `
             -PassThru -NoNewWindow `
             -RedirectStandardOutput spike.out.log `
             -RedirectStandardError spike.err.log
