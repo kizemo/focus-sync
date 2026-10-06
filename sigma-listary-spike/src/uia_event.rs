@@ -54,6 +54,15 @@ pub struct DialogInfo {
     pub dpi: u32,
 }
 
+/// Round 18: monitor emits an enum so the consumer can distinguish
+/// "dialog appeared" from "dialog closed" without leaking monitor-internal
+/// `last_hwnd` state into the main select! loop.
+#[derive(Debug, Clone)]
+pub enum DialogEvent {
+    Opened(DialogInfo),
+    Closed { last_hwnd: isize },
+}
+
 fn monitor_wakeup_sender() -> &'static Mutex<Option<Sender<()>>> {
     static WAKEUP_SENDER: OnceLock<Mutex<Option<Sender<()>>>> = OnceLock::new();
     WAKEUP_SENDER.get_or_init(|| Mutex::new(None))
@@ -155,8 +164,8 @@ fn start_event_wakeup_hook() -> Receiver<()> {
 }
 
 /// Synchronous blocking monitor loop. Run via `tokio::task::spawn_blocking`.
-/// Emits detected `DialogInfo` via `sender` and wakes main tokio loop via `notify.notify_one()`.
-pub fn start_monitor(sender: Sender<Option<DialogInfo>>, notify: Arc<Notify>) {
+/// Emits detected `DialogEvent` via `sender` and wakes main tokio loop via `notify.notify_one()`.
+pub fn start_monitor(sender: Sender<DialogEvent>, notify: Arc<Notify>) {
     const INVALID_HWND: isize = 0;
     const IDLE_POLL_INTERVAL_MS: u64 = 30;
     const TRACKING_POLL_INTERVAL_MS: u64 = 8;
@@ -173,22 +182,31 @@ pub fn start_monitor(sender: Sender<Option<DialogInfo>>, notify: Arc<Notify>) {
 
         if let Some(info) = current_dialog {
             lost_ticks = 0;
-            if last_hwnd != info.hwnd {
+            let (should_push, next_last_hwnd) = dedup_opened(last_hwnd, &info);
+            if should_push {
                 debug!(
                     "[monitor] dialog detected: hwnd={} rect=({}, {}) {}x{}",
                     info.hwnd, info.x, info.y, info.width, info.height
                 );
-                last_hwnd = info.hwnd;
+                last_hwnd = next_last_hwnd;
+                // Round 18: only push when hwnd actually changes — previously the
+                // 8ms polling loop pushed every tick, causing main to re-write the
+                // filename box continuously (flash loop). PathWrap upstream does
+                // not have a polling-loop sender — its dialog_info_if_match is
+                // called once per winit event.
+                let _ = sender.send(DialogEvent::Opened(info));
+                notify.notify_one();
             }
-            let _ = sender.send(Some(info));
-            notify.notify_one();
         } else if last_hwnd != INVALID_HWND {
             // Keep following only the previously-accepted dialog to survive short focus jumps
             // without re-opening detection on unrelated top-level windows.
-            if let Some(info) = get_dialog_info_by_hwnd(last_hwnd) {
+            //
+            // Round 18: dialog still exists at the original hwnd (just lost focus) —
+            // do NOT push again. main already registered this dialog; re-pushing would
+            // cause repeated reader+register churn every 8ms. Only push when we
+            // discover a *new* dialog hwnd or confirm the dialog is gone.
+            if let Some(_info) = get_dialog_info_by_hwnd(last_hwnd) {
                 lost_ticks = 0;
-                let _ = sender.send(Some(info));
-                notify.notify_one();
             } else {
                 // Handle common dialog-handle recreation during open/save transitions.
                 // This fallback only runs while we already have a trusted last_hwnd.
@@ -196,17 +214,18 @@ pub fn start_monitor(sender: Sender<Option<DialogInfo>>, notify: Arc<Notify>) {
                     if last_hwnd != info.hwnd {
                         debug!("[monitor] dialog switched: {} -> {}", last_hwnd, info.hwnd);
                         last_hwnd = info.hwnd;
+                        let _ = sender.send(DialogEvent::Opened(info));
+                        notify.notify_one();
                     }
                     lost_ticks = 0;
-                    let _ = sender.send(Some(info));
-                    notify.notify_one();
                 } else {
                     lost_ticks = lost_ticks.saturating_add(1);
                     if lost_ticks >= LOST_CONFIRM_TICKS {
                         debug!("[monitor] dialog lost: hwnd={}", last_hwnd);
+                        let closed_hwnd = last_hwnd;
                         last_hwnd = INVALID_HWND;
                         lost_ticks = 0;
-                        let _ = sender.send(None);
+                        let _ = sender.send(DialogEvent::Closed { last_hwnd: closed_hwnd });
                         notify.notify_one();
                     }
                 }
@@ -431,4 +450,77 @@ fn get_window_visual_rect(hwnd: HWND) -> Option<RECT> {
 fn get_window_dpi(hwnd: HWND) -> u32 {
     let dpi = unsafe { GetDpiForWindow(hwnd) };
     if dpi == 0 { 96 } else { dpi }
+}
+
+/// Round 18 regression gate: pure dedup decision for the Opened branch of
+/// `start_monitor`. Returns `(should_push, next_last_hwnd)`. The flash-loop
+/// root cause was a missing dedup here (every 8ms tick re-pushed). Extracted
+/// as a free fn so the invariant is testable without a real foreground window.
+fn dedup_opened(last_hwnd: isize, info: &DialogInfo) -> (bool, isize) {
+    if last_hwnd != info.hwnd {
+        (true, info.hwnd)
+    } else {
+        (false, last_hwnd)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn info(hwnd: isize) -> DialogInfo {
+        DialogInfo {
+            hwnd,
+            x: 0,
+            y: 0,
+            width: 0,
+            height: 0,
+            dpi: 96,
+        }
+    }
+
+    /// Round 18 regression: the very first detected hwnd must push.
+    #[test]
+    fn first_hwnd_pushes() {
+        let (push, next) = dedup_opened(0, &info(12345));
+        assert!(push);
+        assert_eq!(next, 12345);
+    }
+
+    /// Round 18 regression: re-observing the same hwnd must NOT push —
+    /// this is the flash-loop fix (8ms polling loop sees the same dialog
+    /// and would otherwise re-push every tick).
+    #[test]
+    fn same_hwnd_does_not_repush() {
+        let (push, next) = dedup_opened(12345, &info(12345));
+        assert!(!push);
+        assert_eq!(next, 12345);
+    }
+
+    /// Round 18 regression: when the dialog hwnd switches (e.g. native
+    /// dialog handle recreation), we must push the new hwnd.
+    #[test]
+    fn different_hwnd_pushes() {
+        let (push, next) = dedup_opened(12345, &info(67890));
+        assert!(push);
+        assert_eq!(next, 67890);
+    }
+
+    /// Round 18 regression: Opened/Closed events are distinguishable so
+    /// main can clean the registry without mirroring last_hwnd.
+    #[test]
+    fn dialog_event_enum_distinguishes_opened_closed() {
+        let info = info(42);
+        let opened = DialogEvent::Opened(info.clone());
+        let closed = DialogEvent::Closed { last_hwnd: 42 };
+
+        match opened {
+            DialogEvent::Opened(i) => assert_eq!(i.hwnd, 42),
+            _ => panic!("expected Opened"),
+        }
+        match closed {
+            DialogEvent::Closed { last_hwnd } => assert_eq!(last_hwnd, 42),
+            _ => panic!("expected Closed"),
+        }
+    }
 }

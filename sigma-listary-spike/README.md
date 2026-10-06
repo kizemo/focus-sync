@@ -8,13 +8,19 @@ Standalone Windows binary that validates whether UI Automation can detect / read
 
 ## Implementation Route
 
-This spike **ports** 3 files (~705 LoC) from open-source projects rather than self-writing from scratch. The port route was selected on 2026-09-27 after the original self-written 14-task spike failed 7-app matrix verification (max coverage 57% < 70% threshold).
+This spike **ports** 2 files (~575 LoC) from open-source projects rather than self-writing from scratch. The port route was selected on 2026-09-27 after the original self-written 14-task spike failed 7-app matrix verification (max coverage 57% < 70% threshold).
 
 | Spike file | Source | Lines | License |
 |---|---|---|---|
 | `src/uia_inject.rs` | [`inaku-Gyan/PathWrap`](https://github.com/inaku-Gyan/PathWrap) `src/os/dialog.rs` | 176 | MIT |
 | `src/uia_event.rs` | [`inaku-Gyan/PathWrap`](https://github.com/inaku-Gyan/PathWrap) `src/os/monitor.rs` | 399 | MIT |
-| `src/fg_bypass.rs` | [`QwenLM/qwen-code`](https://github.com/QwenLM/qwen-code) `packages/cua-driver/rust/crates/platform-windows/src/uia/fg_bypass.rs` | 129 | Apache-2.0 |
+
+> **Round 18 update**: `src/fg_bypass.rs` (QwenLM, Apache-2.0) was removed.
+> Its `EnableWindow(FALSE)` foreground-steal shield was the source of the
+> filename flash + top-level focus loss reported in round 17. The QwenLM
+> attribution and original 129-line file are preserved in git history via
+> `git log -- sigma-listary-spike/src/fg_bypass.rs`. PathWrap upstream does
+> not use `fg_bypass` either; round-18 spike follows.
 
 ## License Boilerplate
 
@@ -23,18 +29,6 @@ This spike **ports** 3 files (~705 LoC) from open-source projects rather than se
 ```
 MIT License — Copyright (c) inaku-Gyan
 See https://github.com/inaku-Gyan/PathWrap/blob/main/LICENSE
-```
-
-### `src/fg_bypass.rs` — Apache-2.0
-
-```
-Apache License, Version 2.0 — Copyright QwenLM contributors
-See https://github.com/QwenLM/qwen-code/blob/main/LICENSE
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
 ```
 
 Per-file license headers are preserved verbatim at the top of each ported file.

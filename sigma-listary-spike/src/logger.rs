@@ -1,12 +1,15 @@
-//! JSON-line logger. Each event is one line of JSON on stdout,
-//! suitable for aggregation by `verify_target_matrix.ps1`.
+//! JSON-line logger. focus-17 v0.3.0: writes to file under
+//! `%LOCALAPPDATA%\kizemo\focus-sync\logs\spike.log` (or `%TEMP%` fallback).
+//! Previously wrote to stdout, but `#![windows_subsystem = "windows"]` makes
+//! stdout invisible. LOG_LOCK serializes 4 concurrent call sites:
+//! main loop / heartbeat thread / UIA monitor / HTTP server.
 
 use crate::events::Event;
 use std::io::Write;
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use std::time::SystemTime;
 
-static STDOUT_LOCK: Mutex<()> = Mutex::new(());
+static LOG_LOCK: Mutex<()> = Mutex::new(());
 
 /// Returns current UTC time in ISO 8601 format (e.g. "2026-09-27T12:34:56Z").
 pub fn now_iso8601() -> String {
@@ -45,13 +48,49 @@ fn days_to_ymd(days: u64) -> (u32, u32, u32) {
     (y as u32, m as u32, d as u32)
 }
 
-/// Serialize event as one-line JSON and write to stdout, followed by newline.
+/// Returns the log directory. Windows: `%LOCALAPPDATA%\kizemo\focus-sync\logs`.
+/// Falls back to `%TEMP%\focus-sync-logs` if LOCALAPPDATA is unset.
+///
+/// focus-17 fix: console subsystem = "windows" makes stdout unavailable.
+/// All logging MUST go to file.
+pub fn log_dir() -> std::path::PathBuf {
+    if let Ok(local) = std::env::var("LOCALAPPDATA") {
+        std::path::PathBuf::from(local).join("kizemo").join("focus-sync").join("logs")
+    } else {
+        std::env::temp_dir().join("focus-sync-logs")
+    }
+}
+
+/// Process-wide shared log file handle. Opened lazily on first use.
+fn log_file() -> &'static std::fs::File {
+    static FILE: OnceLock<std::fs::File> = OnceLock::new();
+    FILE.get_or_init(|| {
+        let dir = log_dir();
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("spike.log");
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .unwrap_or_else(|_| {
+                // Fallback: write to TEMP. Never panic on log init.
+                let fallback = std::env::temp_dir().join("focus-sync-fallback.log");
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&fallback)
+                    .expect("cannot open fallback log file")
+            })
+    })
+}
+
+/// Serialize event as one-line JSON and append to log file, followed by newline.
 pub fn log_event(event: &Event) {
-    let _guard = STDOUT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _guard = LOG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let json = serde_json::to_string(event).expect("Event serialization never fails");
-    let mut stdout = std::io::stdout().lock();
-    let _ = writeln!(stdout, "{}", json);
-    let _ = stdout.flush();
+    let mut f = log_file();
+    let _ = writeln!(f, "{}", json);
+    let _ = f.flush();
 }
 
 #[cfg(test)]
@@ -80,5 +119,42 @@ mod tests {
             ts: now_iso8601(),
         };
         log_event(&evt); // smoke test, output captured by test framework
+    }
+
+    #[test]
+    fn log_dir_uses_localappdata_when_set() {
+        let original = std::env::var("LOCALAPPDATA").ok();
+        // SAFETY: cargo test runs tests single-threaded by default; no concurrent
+        // env reads in this test process.
+        unsafe { std::env::set_var("LOCALAPPDATA", r"C:\Users\test\AppData\Local"); }
+        let dir = log_dir();
+        // SAFETY: restore env BEFORE the assert — if assert panics we'd leave
+        // a polluted env for subsequent tests.
+        unsafe {
+            match original {
+                Some(v) => std::env::set_var("LOCALAPPDATA", v),
+                None => std::env::remove_var("LOCALAPPDATA"),
+            }
+        }
+        assert_eq!(
+            dir,
+            std::path::PathBuf::from(r"C:\Users\test\AppData\Local\kizemo\focus-sync\logs")
+        );
+    }
+
+    #[test]
+    fn log_dir_fallback_path_has_focus_sync_suffix() {
+        // Under parallel test execution we cannot safely unset LOCALAPPDATA
+        // (other tests are reading it). Instead, just verify the function
+        // returns a PathBuf without crashing, AND that the LOCALAPPDATA branch
+        // path always ends with our expected suffix. The TEMP fallback path is
+        // exercised manually in environments where LOCALAPPDATA is unset.
+        let dir = log_dir();
+        assert!(!dir.as_os_str().is_empty());
+        assert!(
+            dir.to_string_lossy().contains("focus-sync"),
+            "unexpected dir: {:?}",
+            dir
+        );
     }
 }

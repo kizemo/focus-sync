@@ -19,6 +19,12 @@
 //     before bypass → 0 z-drops after.
 //
 // See handoff §6.3 for detailed adaptation notes.
+//
+// focus-18 (2026-10-01): re-imported after round-18 deletion. The wrapper is now
+// gated to Chromium hosts (`Chrome_WidgetWin_*`); native IFileDialog / WinUI dialogs
+// fall through unmodified. This restoration enables `Invoke` on Save buttons in
+// Chromium / Edge WinUI Save As dialogs without stealing foreground focus from
+// Sigma FM.
 
 //! Foreground-steal bypass for Chromium / Electron hosts during UIA `Invoke` calls.
 //!
@@ -126,5 +132,37 @@ fn get_class_name(hwnd: HWND) -> String {
             Ok(n) if n > 0 => String::from_utf16_lossy(&buf[..n]),
             _ => String::new(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// focus-18: run_with_bypass with hwnd=0 must NOT panic and the closure
+    /// must execute normally (the guard is not armed for null HWND).
+    #[test]
+    fn run_with_bypass_null_hwnd_runs_action() {
+        let mut counter = 0;
+        run_with_bypass(0, || {
+            counter += 1;
+        });
+        assert_eq!(counter, 1);
+    }
+
+    /// focus-18: run_with_bypass must propagate the closure return value
+    /// (it is generic over T and returns whatever action returns).
+    #[test]
+    fn run_with_bypass_returns_value() {
+        let v = run_with_bypass(0, || 42_u32);
+        assert_eq!(v, 42);
+    }
+
+    /// focus-18: get_class_name on an invalid HWND returns empty (no panic).
+    /// Documents the contract `is_chromium_target_window` relies on.
+    #[test]
+    fn get_class_name_invalid_hwnd_returns_empty() {
+        let bad = HWND(0xDEADBEEFusize as *mut core::ffi::c_void);
+        assert!(get_class_name(bad).is_empty());
     }
 }
