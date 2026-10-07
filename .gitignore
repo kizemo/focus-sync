@@ -17,3 +17,6 @@ Thumbs.db
 # 本地笔记草稿(只追踪 docs/ 下的正式文档)
 drafts/
 *.draft.md
+scripts/__pycache__/
+.other/
+*.pyc

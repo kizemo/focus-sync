@@ -40,6 +40,34 @@ Write-Host "==> Step 2: Copying extension files..."
 Write-Host "    Source:      $srcDir"
 Write-Host "    Destination: $extDir"
 
+# ---- Sandbox gate (focus-21 Phase 4) ----
+# MUST run before any copy: once index.js lands in %APPDATA%, Sigma FM will
+# try to load it. If any sandbox regex matches (even inside a comment),
+# validateExtensionCode() rejects it and loader.ts throws BEFORE new Worker(),
+# so the extension silently never loads — no UI error, no notification, and
+# the sidecar receives 0 requests. Rules are read LIVE from sandbox.ts.
+$srcIndexJs     = Join-Path $srcDir 'dist\index.js'
+$sandboxScanner = Join-Path $ScriptDir '..\..\scripts\scan-sandbox-dynamic.cjs'
+$sandboxTs      = Join-Path $ScriptDir '..\..\sigma-file-manager\src\modules\extensions\runtime\sandbox.ts'
+Write-Host "==> Validating extension against Sigma FM sandbox (dynamic)"
+if (-not (Test-Path $sandboxScanner)) {
+    Write-Error "Sandbox scanner not found at $sandboxScanner"
+    exit 1
+}
+# Pass sandbox.ts explicitly: the scanner's default is CWD-relative, so
+# relying on it would FATAL (exit 2) whenever this script runs from
+# another directory.
+& node $sandboxScanner $srcIndexJs $sandboxTs
+if ($LASTEXITCODE -ne 0) {
+    Write-Error @"
+SANDBOX VALIDATION FAILED (exit $LASTEXITCODE).
+Refusing to deploy an extension Sigma FM will reject. It would load
+SILENTLY-NEVER — no UI error, no notification, sidecar gets 0 requests.
+"@
+    exit 1
+}
+Write-Host "    Extension sandbox validation PASSED"
+
 # Top-level files
 New-Item -ItemType Directory -Path $extDir -Force | Out-Null
 New-Item -ItemType Directory -Path (Join-Path $extDir 'dist') -Force | Out-Null

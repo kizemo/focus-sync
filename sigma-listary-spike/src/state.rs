@@ -12,7 +12,7 @@
 //! - `session_id: u32`                   — set once at startup (ProcessIdToSessionId)
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -62,6 +62,56 @@ pub struct AppState {
     // equality (e.g. `current != "C:\\"`) avoids false negatives when user
     // legitimately navigates to "C:\\" root.
     pub first_push_received: AtomicBool,
+
+    // ---- v0.5.7 F-1: single source of truth for "which dialog is foreground"
+    //
+    // WHY WE DO NOT CALL GetForegroundWindow() INSTEAD:
+    //   GetForegroundWindow() answers for the CALLING THREAD's input queue.
+    //   `uia_event::start_monitor` runs via spawn_blocking and pumps Windows
+    //   messages (GetMessageW/DispatchMessageW), so its answer is correct.
+    //   `http_server::run_server` runs on a plain `std::thread::spawn` with NO
+    //   message pump; its answers disagreed with the monitor thread's.
+    //
+    // OBSERVED FAILURE (2026-10-07 16:39): the monitor tracked hwnd=135716 as
+    // foreground continuously from 16:39:12.270 to 16:39:25.456, while the
+    // HTTP thread's foreground check reported "not foreground" at 16:39:21 and
+    // deferred EVERY /set_path. Sync never happened. This also explains the
+    // long-standing `current=HWND(0x0)` in the SendInput warn line.
+    //
+    // Contract: the monitor thread publishes here every tick; everyone else
+    // reads this value instead of querying the OS themselves.
+    // 0 = no foreground file dialog.
+    pub foreground_dialog_hwnd: AtomicI64,
+
+    // ---- v0.5.7 G-2: is a write-back currently executing?
+    //
+    // The monitor polls every 8ms while tracking a dialog; one UIA+SendInput
+    // write takes ~300ms. Without this flag the monitor re-fires `Opened`
+    // ~30x per write. Combined with G-1 that became an infinite resync loop
+    // (observed 2026-10-07 21:37, 1364 resyncs of the SAME path, address bar
+    // accumulating the path over and over).
+    pub sync_in_progress: AtomicBool,
+}
+
+/// v0.5.7 G-2 — RAII guard so a write-back cannot be left stuck "in
+/// progress" if it returns early or panics. The monitor refuses to re-fire
+/// while this is set, so a leaked flag would freeze re-sync (fail-safe:
+/// sync stops rather than loops).
+pub struct SyncGuard<'a> {
+    state: &'a AppState,
+}
+
+impl<'a> Drop for SyncGuard<'a> {
+    fn drop(&mut self) {
+        self.state.sync_in_progress.store(false, Ordering::SeqCst);
+    }
+}
+
+impl<'a> std::ops::Deref for SyncGuard<'a> {
+    type Target = AppState;
+    fn deref(&self) -> &Self::Target {
+        self.state
+    }
 }
 
 impl AppState {
@@ -77,6 +127,54 @@ impl AppState {
             committed_hwnds: Mutex::new(HashSet::new()),
             unsupported_dialog_count: AtomicU64::new(0),
             first_push_received: AtomicBool::new(false),
+            foreground_dialog_hwnd: AtomicI64::new(0),
+            sync_in_progress: AtomicBool::new(false),
+        }
+    }
+
+    /// v0.5.7 F-1 — publish the current foreground dialog HWND.
+    /// Only the monitor thread (which pumps Windows messages) may call this.
+    /// `0` means "no foreground file dialog right now".
+    pub fn set_foreground_dialog(&self, hwnd: u32) {
+        self.foreground_dialog_hwnd
+            .store(hwnd as i64, Ordering::Relaxed);
+    }
+
+    /// Enter a write-back section; the monitor will not re-fire until the
+    /// returned guard is dropped.
+    pub fn begin_sync(&self) -> SyncGuard<'_> {
+        self.sync_in_progress.store(true, Ordering::SeqCst);
+        SyncGuard { state: self }
+    }
+
+    pub fn sync_in_progress(&self) -> bool {
+        self.sync_in_progress.load(Ordering::SeqCst)
+    }
+
+    /// v0.5.7 G-1 — what we last wrote into this dialog (its `last_known_path`).
+    ///
+    /// This field was documented as the dedup key for re-opened dialogs but was
+    /// only ever WRITTEN, never READ, so the round-18 monitor dedup degraded
+    /// into "suppress every repeat Opened for a known hwnd". A known dialog
+    /// could therefore never re-sync after the user returned to it
+    /// (2026-10-07 21:14-21:21 incident).
+    ///
+    /// Returns None when the dialog is not in the registry.
+    pub fn last_written_path(&self, hwnd: u32) -> Option<String> {
+        let reg = self.registry.lock().unwrap_or_else(|e| e.into_inner());
+        reg.get(&hwnd).map(|d| d.last_known_path.clone())
+    }
+
+    /// v0.5.7 G-1 — read the foreground dialog HWND published by the monitor.
+    /// Every other component must use THIS rather than calling
+    /// `GetForegroundWindow()` itself, which answers per-calling-thread and is
+    /// unreliable from the HTTP thread (see the field docs for the incident).
+    pub fn foreground_dialog(&self) -> u32 {
+        let v = self.foreground_dialog_hwnd.load(Ordering::Relaxed);
+        if v <= 0 {
+            0
+        } else {
+            v as u32
         }
     }
 
@@ -210,6 +308,69 @@ pub struct HealthSnapshot {
     pub first_push_received: bool,
 }
 
+#[cfg(test)]
+mod g2_sync_guard_tests {
+    use super::{AppState, DialogInfo};
+
+    fn seeded() -> AppState {
+        let s = AppState::new("E:\\Models".into(), 1);
+        s.register_dialog(DialogInfo {
+            hwnd: 722614,
+            app: "#32770".into(),
+            last_known_path: "11.politics".into(),
+            write_strategy: None,
+        });
+        s
+    }
+
+    /// last_written_path must reflect the registry — this is the G-1 dedup
+    /// key that was previously written but never read.
+    #[test]
+    fn last_written_path_reflects_registry() {
+        let s = seeded();
+        assert_eq!(s.last_written_path(722614).as_deref(), Some("11.politics"));
+        assert_eq!(s.last_written_path(999), None);
+    }
+
+    /// begin_sync sets the flag; dropping the guard clears it (RAII), so a
+    /// write that returns early cannot wedge re-sync permanently.
+    #[test]
+    fn begin_sync_clears_on_drop() {
+        let s = seeded();
+        assert!(!s.sync_in_progress());
+        {
+            let _g = s.begin_sync();
+            assert!(s.sync_in_progress());
+        }
+        assert!(!s.sync_in_progress());
+    }
+
+    /// REGRESSION for the 2026-10-07 21:37 infinite loop (1364 resyncs of the
+    /// SAME path). While a write-back is in flight the monitor must be held
+    /// off; otherwise it re-fires `Opened` every 8ms for the ~300ms the write
+    /// takes, and each re-fire re-clobbers the dedup key.
+    #[test]
+    fn in_progress_write_blocks_monitor_refire() {
+        let s = seeded();
+        // Before the write: the key still differs from pending -> resync wanted.
+        let key_before = s.last_written_path(722614);
+        assert_ne!(key_before.as_deref(), Some(s.get_current_path().as_str()));
+        // While the write is running the monitor is gated off...
+        {
+            let _g = s.begin_sync();
+            assert!(s.sync_in_progress(), "monitor must be held off during write");
+        }
+        // ...and after it completes the key is updated so no resync is wanted.
+        s.register_dialog(DialogInfo {
+            hwnd: 722614,
+            app: "#32770".into(),
+            last_known_path: s.get_current_path(),
+            write_strategy: None,
+        });
+        let key_after = s.last_written_path(722614);
+        assert_eq!(key_after.as_deref(), Some(s.get_current_path().as_str()));
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;

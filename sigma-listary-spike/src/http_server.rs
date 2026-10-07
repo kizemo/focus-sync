@@ -26,6 +26,9 @@ use serde::{Deserialize, Serialize};
 use std::io::Read;
 use std::sync::Arc;
 use tiny_http::{Header, Method, Response, Server, StatusCode};
+// v0.5.7 F-1: used ONLY for the foreground self-check log (the decision itself
+// reads the monitor-published shared value). See set_path_deferred_not_foreground.
+use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
 
 // v0.5.5: 41477 exclusion + first_push_received flag + /health expose +
 // should_opened_write_back helper. See:
@@ -235,10 +238,62 @@ fn handle_set_path(
         ts: now_iso8601(),
     });
     for d in dialogs {
+        // v0.5.7 R-2 (2026-10-07, user feedback): /set_path must NOT touch a
+        // BACKGROUND dialog.
+        //
+        // The user observed that navigating in Sigma FM yanks focus back to the
+        // download dialog. Cause: this loop wrote to every registered dialog
+        // regardless of focus, and the UIA/SendInput path took foreground.
+        //
+        // New contract:
+        //   - Sigma FM pushes a path  -> we STORE it only.
+        //   - User brings the dialog forward -> uia_event's monitor (which only
+        //     detects FOREGROUND dialogs) emits Opened -> opened_write_back
+        //     performs the actual navigation.
+        // So a background dialog is simply skipped here; the pending write is
+        // picked up the moment the user focuses it.
+        // v0.5.7 F-1: read the foreground answer published by the MONITOR
+        // thread. Do NOT call GetForegroundWindow() here — this thread has no
+        // Windows message pump and its answer disagreed with the monitor's,
+        // which deferred every push (2026-10-07 16:39 incident).
+        //
+        // The local call is made ONLY as a self-check and logged, so that any
+        // future disagreement is observable rather than silent.
+        let fg_shared = state.foreground_dialog();
+        let fg_local = unsafe {
+            let h = GetForegroundWindow();
+            if h.0.is_null() {
+                0
+            } else {
+                h.0 as u32
+            }
+        };
+        if fg_shared != d.hwnd {
+            log_event(&Event::SpikeError {
+                kind: "set_path_deferred_not_foreground".into(),
+                message: format!(
+                    "hwnd={} app={} shared_fg={fg_shared} local_fg={fg_local} \
+                     AGREE={}; path stored, will sync when the user focuses the dialog",
+                    d.hwnd,
+                    d.app,
+                    fg_shared == fg_local
+                ),
+                ts: now_iso8601(),
+            });
+            if fg_shared != fg_local {
+                tracing::warn!(
+                    shared_fg = fg_shared,
+                    local_fg = fg_local,
+                    "v0.5.7 F-1 SELF-CHECK: shared and local foreground DISAGREE \
+                     (expected: local is unreliable on this thread)"
+                );
+            }
+            continue;
+        }
         log_event(&Event::SpikeError {
             kind: "set_path_iter".into(),
             message: format!(
-                "hwnd={} app={} auto_confirm={}",
+                "hwnd={} app={} auto_confirm={} (shared_fg matched)",
                 d.hwnd, d.app, auto_confirm
             ),
             ts: now_iso8601(),

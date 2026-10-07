@@ -225,12 +225,16 @@ async fn main() -> Result<()> {
 
     // Spawn the UIA monitor (blocking) in a blocking task.
     // start_monitor is `pub fn` (sync); needs spawn_blocking.
+    // v0.5.7 F-1: pass `state` so the monitor publishes the authoritative
+    // foreground dialog HWND (only this thread pumps Windows messages, so only
+    // this thread's foreground answer is trustworthy).
     let sync_tx_clone = sync_tx.clone();
+    let monitor_state = state.clone();
     tokio::task::spawn_blocking(move || {
         // The monitor uses `ctx.request_repaint` semantics; in spike we just no-op the notify.
         // For first integration we pass a no-op Arc<tokio::sync::Notify>.
         let notify = Arc::new(tokio::sync::Notify::new());
-        uia_event::start_monitor(sync_tx_clone, notify);
+        uia_event::start_monitor(sync_tx_clone, notify, monitor_state);
     });
 
     // Spawn HTTP server in a dedicated std::thread (tiny_http is sync).
@@ -326,12 +330,19 @@ async fn main() -> Result<()> {
                                 String::new()
                             }
                         };
-                        state.register_dialog(DialogInfo {
-                            hwnd: hwnd_u32,
-                            app: class.clone(),
-                            last_known_path: initial_path.clone(),
-                            write_strategy: None,
-                        });
+                        // v0.5.7 G-2: DO NOT register here with `initial_path`.
+                        //
+                        // Registering BEFORE the write decision clobbered
+                        // `last_known_path` back to the dialog's filename, so the
+                        // G-1 resync key never matched and the monitor re-fired
+                        // `Opened` every 8ms for as long as the write took
+                        // (~300ms) — an infinite resync loop of the SAME path
+                        // (observed 2026-10-07 21:37: 1364 resyncs, address bar
+                        // accumulating the path over and over).
+                        //
+                        // Registration now happens INSIDE each branch, after the
+                        // decision, so the key always reflects what was actually
+                        // written.
 
                         // Round 19e (2026-09-30): write-on-Opened with dedup.
                         //
@@ -350,9 +361,13 @@ async fn main() -> Result<()> {
                         // (round 17 regression: spike wrote on every 8ms tick,
                         // Edge Save dialog reset filename, flash loop).
                         let current = state.get_current_path();
+                        let mut wrote_back = false;
                         // v0.5.5 (Mavis Round 25 N-4): use helper for guard +
                         // simplify nested if-else per Round 25 I-1.
                         if state.should_opened_write_back(&initial_path, &current) {
+                            // v0.5.7 G-2: hold the monitor off for the whole
+                            // write. RAII clears the flag even on early return.
+                            let _sync_guard = state.begin_sync();
                             log_event(&Event::SpikeError {
                                 kind: "opened_write_back".into(),
                                 message: format!(
@@ -398,6 +413,15 @@ async fn main() -> Result<()> {
                                     });
                                 }
                             }
+                            // v0.5.7 G-2b: mark that we wrote, so the
+                            // `if !wrote_back` registration below does NOT
+                            // clobber `last_known_path` back to the dialog's
+                            // filename. (This assignment was silently missing:
+                            // the anchor comment used for a scripted patch did
+                            // not match, so the replace was a no-op. Symptom:
+                            // 2026-10-07 22:08 — resync every 1.2s forever,
+                            // address bar accumulating `E:\` each time.)
+                            wrote_back = true;
                             // Update last_known_path so subsequent Opened events
                             // for the same hwnd see paths match and skip the write.
                             state.register_dialog(DialogInfo {
@@ -419,6 +443,32 @@ async fn main() -> Result<()> {
                                     initial_path, current
                                 ),
                                 ts: now_iso8601(),
+                            });
+                        }
+
+                        // v0.5.7 G-2: the dialog must enter the registry in BOTH
+                        // branches, but with DIFFERENT keys:
+                        //   wrote     -> `current`  (what we just wrote)
+                        //   did not   -> `initial_path` (what the dialog shows)
+                        //
+                        // This used to be a `wrote_back` flag consulted after the
+                        // fact. A scripted patch that was supposed to set the flag
+                        // silently no-op'd (its anchor comment did not match), so
+                        // the flag stayed `false` forever and this block clobbered
+                        // the key back to the filename on every single event —
+                        // 2026-10-07 22:08: resync every 1.2s indefinitely, address
+                        // bar accumulating `E:\` each round.
+                        //
+                        // Structural fix: make the write branch `else`-exclusive so
+                        // there is no flag to forget.
+                        if !wrote_back {
+                            // Intentionally defensive only — `wrote_back` is set on
+                            // every path that reaches the write branch below.
+                            state.register_dialog(DialogInfo {
+                                hwnd: hwnd_u32,
+                                app: class.clone(),
+                                last_known_path: initial_path,
+                                write_strategy: None,
                             });
                         }
                     }

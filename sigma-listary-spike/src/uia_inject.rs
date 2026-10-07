@@ -70,7 +70,15 @@ use windows::Win32::UI::Accessibility::{
 };
 use windows::Win32::UI::Shell::{IFileDialog, IShellItem, SHCreateItemFromParsingName};
 use windows::Win32::UI::WindowsAndMessaging::{
-    AllowSetForegroundWindow, GetForegroundWindow, SendMessageW, SetForegroundWindow, WM_KEYDOWN, WM_KEYUP,
+    SendMessageW, WM_KEYDOWN, WM_KEYUP, GetForegroundWindow,
+    // v0.5.7 F-0 guard 2: cross-process focus query.
+    // GetFocus() returns the CALLING THREAD's focus and is blind to other
+    // processes (it never fired across 48 historical H1 dispatches).
+    // GetGUIThreadInfo(thread_id) DOES answer "what has keyboard focus in the
+    // foreground window's thread", which is exactly the question the user
+    // cares about: "is focus still on the address bar, or did it jump back
+    // to the filename box?".
+    GetGUIThreadInfo, GetWindowThreadProcessId, GUITHREADINFO,
 };
 // v0.5.1 (Mavis 第 13 轮 D2 [HIGH]): complete SendInput helper imports.
 // windows-rs 0.62 names the keyboard-flag newtype `KEYBD_EVENT_FLAGS`
@@ -81,8 +89,12 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     SendInput as SendInputFn, INPUT, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS,
     VIRTUAL_KEY, VK_L, VK_CONTROL,
     KEYEVENTF_UNICODE, KEYEVENTF_KEYUP,
-    VK_HOME, VK_END, VK_SHIFT,
-    GetFocus,  // ← v0.5.3 (Mavis C1 必修): post-SendInput focus verify
+    VK_END, VK_BACK,
+    // v0.5.7 F-0: `GetFocus` REMOVED from this import list. It returns the
+    // CALLING THREAD's focus window and cannot observe another process's
+    // focus, so the old I1 check never fired (0 occurrences across 48
+    // historical H1 dispatches). The filename-box read-back (UIA, which works
+    // cross-process) replaces it.
 };
 use windows::core::GUID;
 
@@ -231,51 +243,159 @@ fn make_unicode_release(ch: u16) -> INPUT {
     input
 }
 
-/// v0.5.3 H1 — SendInput Ctrl+L + Home+Shift+End + path. NO Enter. NO focus theft.
+/// v0.5.7 F-0 guard 2 — which element currently holds keyboard focus in the
+/// FOREGROUND window's thread (works cross-process, unlike `GetFocus()`).
 ///
-/// Strategy (Mavis 第 15/16/17 轮 review 综合):
-///   1. `AllowSetForegroundWindow(ASFW_ANY)` — accept any sender
-///      (no-op in sidecar context per D3, but kept for completeness).
-///   2. `SetForegroundWindow(dialog)` — try to bring the dialog forward.
-///      May fail under the Vista+ foreground lock; we proceed regardless.
-///   3. **GetForegroundWindow check** — warn if dialog is not foreground
-///      so user knows events may have gone elsewhere (Mavis A4).
-///   4. `SendInput Ctrl+L` — focus Chromium's address bar.
-///   5. `SendInput Home + Shift+End` — basic Edit operations that WinUI 3
-///      is unlikely to intercept. Replaces v0.5.2's broken Ctrl+A.
-///   6. `SendInput path chars` (press + release per MSDN).
-///   7. **NO Enter** (Rule 47 — user wants manual Save confirmation).
-///   8. **post-SendInput focus verify** — GetFocus + UIA read-back; warn if
-///      focus landed on filename box (1001) — pollution risk (Mavis I1).
-///
-/// Returns true iff SendInput accepted every INPUT. Does NOT auto-trigger Save.
-/// Does NOT steal focus from user (Mavis A1 — KEEP SetForegroundWindow but
-/// it usually no-ops; extension has been updated to NOT call
-/// AllowSetForegroundWindow so Sigma FM never gets yanked).
-fn try_send_path_via_sendinput(dialog_hwnd: u32, target_path: &str) -> bool {
-    let hwnd = HWND(dialog_hwnd as *mut core::ffi::c_void);
+/// Returns `None` when the answer cannot be determined (no foreground window,
+/// `GetGUIThreadInfo` refused, focus HWND is null, or UIA could not resolve it).
+fn foreground_focus_automation_id() -> Option<String> {
     unsafe {
-        // Mavis A1 (第 15 轮): KEEP AllowSetForegroundWindow + SetForegroundWindow.
-        // SendInput dispatches events to the foreground window — if dialog
-        // is backgrounded, events go to Sigma FM (worse: would pollute
-        // Sigma FM's search box).
-        let _ = AllowSetForegroundWindow(ASFW_ANY);
-        let _ = SetForegroundWindow(hwnd);
+        let fg = GetForegroundWindow();
+        if fg.0.is_null() {
+            return None;
+        }
+        let tid = GetWindowThreadProcessId(fg, None);
+        if tid == 0 {
+            return None;
+        }
+        let mut gi = GUITHREADINFO {
+            cbSize: std::mem::size_of::<GUITHREADINFO>() as u32,
+            ..Default::default()
+        };
+        if GetGUIThreadInfo(tid, &mut gi).is_err() {
+            return None;
+        }
+        if gi.hwndFocus.0.is_null() {
+            return None;
+        }
+        let uia = automation()?;
+        let elem = uia.ElementFromHandle(gi.hwndFocus).ok()?;
+        Some(current_automation_id(&elem))
+    }
+}
 
-        // Mavis A4: check if dialog actually became foreground. Warn user
-        // so they know SendInput may not reach dialog (race window).
-        let current_fg = GetForegroundWindow();
-        if current_fg != hwnd {
+/// v0.5.7 F-0 — pure decision function for the Enter guard.
+///
+/// Returns `true` when the path appears to have landed in the FILENAME box
+/// (or when we cannot tell), i.e. "DO NOT press Enter".
+///
+/// Fail-safe by construction: every ambiguous case returns `true`, so the
+/// worst outcome is "sync does not happen" (visible, recoverable) rather than
+/// "file saved unexpectedly".
+fn path_landed_in_filename_box(before: Option<&str>, after: Option<&str>) -> bool {
+    match (before, after) {
+        (Some(b), Some(a)) => b != a,
+        // Cannot read one or both snapshots -> assume unsafe.
+        _ => true,
+    }
+}
+
+/// v0.5.7 F-0 helper — read an element's current ValuePattern text, if any.
+fn read_edit_value(edit: &IUIAutomationElement) -> Option<String> {
+    let value: IUIAutomationValuePattern =
+        unsafe { edit.GetCurrentPatternAs(UIA_ValuePatternId) }.ok()?;
+    unsafe { value.CurrentValue() }.ok().map(|b| b.to_string())
+}
+
+/// v0.5.7 F-0 helper — write an element's ValuePattern text.
+fn write_edit_value(edit: &IUIAutomationElement, text: &str) -> bool {
+    let value: Result<IUIAutomationValuePattern> =
+        unsafe { edit.GetCurrentPatternAs(UIA_ValuePatternId) };
+    match value {
+        Ok(v) => unsafe { v.SetValue(&BSTR::from(text)) }.is_ok(),
+        Err(_) => false,
+    }
+}
+
+/// v0.5.7 F-0 — SendInput Ctrl+L + Home+Shift+End + path, THEN guarded Enter.
+///
+/// HISTORY — why this is not simply "re-adding Enter":
+///   v0.5.1 (2026-10-05) shipped `Enter + commit_save_button` and the user
+///   reported "下载启动后,跳过了路径选择步骤,直接启动下载". BOTH were removed
+///   in v0.5.1. Re-adding a bare Enter would repeat that incident.
+///
+///   v0.5.7 differs in three ways:
+///   1. **No `commit_save_button` ever.** We never Invoke the Save button.
+///   2. **Enter is gated by a read-back.** Before typing we snapshot the
+///      filename box (best_edit); after typing we read it again. If the value
+///      CHANGED, Ctrl+L did not take effect and the path landed in the
+///      FILENAME box — pressing Enter there would activate Save. In that case
+///      we SKIP Enter and let H2 clean up / degrade.
+///   3. **Fail-safe direction.** If we cannot read the filename box at all, we
+///      also skip Enter. The failure mode is "sync does not happen" (visible,
+///      recoverable) rather than "file saved unexpectedly" (Rule 60).
+///
+/// Enter in the address bar performs NAVIGATION ONLY. It does not click Save.
+/// Navigation != Save (Rule 47 governs auto-Save, not auto-navigate).
+///
+/// Strategy (v0.5.7 — R-1 removed focus stealing, F-0 added guarded Enter):
+///   1. **GetForegroundWindow check — abort if the dialog is not foreground.**
+///      We NEVER call SetForegroundWindow / AllowSetForegroundWindow. The user
+///      owns focus; the only reason we are here is that they already brought
+///      the dialog forward (via the uia_event monitor, which only detects
+///      FOREGROUND dialogs).
+///   2. `SendInput Ctrl+L` — focus Chromium's address bar.
+///   3. `SendInput Home + Shift+End` — basic Edit ops WinUI 3 is unlikely to
+///      intercept. Replaces v0.5.2's broken Ctrl+A.
+///   4. `SendInput path chars` (press + release per MSDN).
+///   5. **Read back the filename box** (replaces the dead GetFocus() verify,
+///      see note below). Guard 1.
+///   6. **Live focus check via GetGUIThreadInfo.** Guard 2 — blocks Enter if
+///      focus jumped back to the filename box.
+///   7. **Conditionally send Enter** — only if BOTH guards prove it is safe.
+///      Enter here navigates only; it never invokes Save.
+///
+///
+/// NOTE on the removed GetFocus() verify (Mavis I1):
+///   `GetFocus()` returns the focus window of the CALLING THREAD's message
+///   queue — it cannot see another process's focus. The dialog lives in
+///   Edge's process, so this check never fired: across 48 historical H1
+///   dispatches the `post-SendInput focus aid=` log appears ZERO times.
+///   The filename-box read-back below works across processes (UIA) and
+///   actually answers the question ("did the path land in the filename box?").
+///
+/// Returns true iff SendInput accepted every INPUT.
+fn try_send_path_via_sendinput(
+    state: &crate::state::AppState,
+    dialog_hwnd: u32,
+    target_path: &str,
+    best_edit: Option<&IUIAutomationElement>,
+) -> bool {
+    // v0.5.7 F-1: the HWND is no longer needed here. R-1 removed
+    // SetForegroundWindow (no more focus stealing) and F-1 replaced the local
+    // GetForegroundWindow() check with the monitor-published shared value, so
+    // nothing in this function touches the raw HWND any more.
+    unsafe {
+        // v0.5.7 R-1 (2026-10-07, user feedback): NO focus stealing.
+        //
+        // The previous code called `AllowSetForegroundWindow` + `SetForegroundWindow`
+        // here. The user observed that navigating in Sigma FM yanks focus back to
+        // the download dialog's filename box. That is unacceptable:
+        //   "在 sigma 中切换路径后,焦点会自动回到下载弹窗的文件名处,这是错误的
+        //    ——sigma 中切换路径,不应自动把焦点切回下载弹窗,只有使用者手动切换"
+        //
+        // We therefore NEVER take foreground. SendInput only reaches the dialog
+        // if the USER already brought it forward — which is exactly the trigger
+        // we want. If the dialog is not foreground, the check below aborts H1 and
+        // we fall through to the no-foreground-dependency fallback.
+        //
+        // (Consequence: the `/set_path` handler must not call into this path for
+        // a background dialog. See R-2 in http_server.rs.)
+        // v0.5.7 F-1: read the AUTHORITATIVE foreground answer published by the
+        // monitor thread. Do NOT call GetForegroundWindow() here — this code
+        // runs on the HTTP thread (no Windows message pump) or the tokio main
+        // thread, and their answers disagreed with the monitor's. That
+        // disagreement is what produced `current=HWND(0x0)` in the SendInput
+        // warn line and deferred every /set_path (2026-10-07 16:39).
+        let current_fg = state.foreground_dialog();
+        if current_fg != dialog_hwnd {
             warn!(
-                "v0.5.5 SendInput: dialog hwnd={hwnd:?} is not foreground \
-                 (current={current_fg:?}); aborting to trigger H2 fallback."
+                "v0.5.7 H1: dialog hwnd={dialog_hwnd} is not foreground \
+                 (monitor-published fg={current_fg}); NOT stealing focus, \
+                 aborting to fallback."
             );
-            // v0.5.4 (2026-10-06 复盘): MUST abort instead of silent continue.
-            // Per Mavis review §1.3: SendInput events dispatch to the
-            // foreground window (possibly NOT dialog). Without abort + H2
-            // fallback, dialog never receives the path and user sees
-            // "completely no response". Abort returns false → inject_via_uia
-            // falls through to H2 (UIA SetValue, no foreground dependency).
+            // MUST abort: SendInput would deliver Ctrl+L and the path characters
+            // to whatever IS foreground (Sigma FM), polluting its search box.
             return false;
         }
 
@@ -290,55 +410,133 @@ fn try_send_path_via_sendinput(dialog_hwnd: u32, target_path: &str) -> bool {
         inputs.push(make_key(VK_L.0, KEYEVENTF_KEYUP.0));
         inputs.push(make_key(VK_CONTROL.0, KEYEVENTF_KEYUP.0));
 
-        // Step 5: Home + Shift+End — basic Edit operations that WinUI 3 is
-        // unlikely to intercept (vs. Ctrl+A which is a Chrome extension that
-        // WinUI 3 may eat). Replaces v0.5.2's broken Ctrl+A.
-        inputs.push(make_key(VK_HOME.0, 0));
-        inputs.push(make_key(VK_HOME.0, KEYEVENTF_KEYUP.0));
-        inputs.push(make_key(VK_SHIFT.0, 0));
+        // Step 5: CLEAR the address bar, then type. (v0.5.7 G-5)
+        //
+        // G-4 tried Ctrl+A + Home+Shift+End to select the existing text before
+        // typing. It does NOT work in this dialog — proven 2026-10-07 22:44:
+        // exactly ONE injection ran and the address bar became
+        // "F:\booksE:\e", producing Windows' error "找不到 F:\booksE:\e".
+        //
+        // Why selection fails here: in a WinUI 3 / Chromium file dialog Ctrl+A
+        // is consumed by the FILE LIST ("select all files"), and Home/End are
+        // consumed by the list too. Only the synthesized unicode path
+        // characters actually reach the address-bar edit, so typing APPENDS at
+        // the caret instead of replacing the selection.
+        //
+        // Robust alternative that does not depend on selection semantics:
+        //   End  -> caret to the end of the line
+        //   N × Backspace -> clear whatever is there
+        // Both are safe under either behaviour (selection present or not) and
+        // converge on an empty field. Backspace on an address bar is a plain
+        // edit; there is no destructive action bound to it in this dialog.
         inputs.push(make_key(VK_END.0, 0));
         inputs.push(make_key(VK_END.0, KEYEVENTF_KEYUP.0));
-        inputs.push(make_key(VK_SHIFT.0, KEYEVENTF_KEYUP.0));
-
+        for _ in 0..128 {
+            inputs.push(make_key(VK_BACK.0, 0));
+            inputs.push(make_key(VK_BACK.0, KEYEVENTF_KEYUP.0));
+        }
         // Step 6: type the path char-by-char (press + release per MSDN).
         for ch in target_path.encode_utf16() {
             inputs.push(make_unicode(ch));
             inputs.push(make_unicode_release(ch));
         }
 
+        // v0.5.7 F-0 step 7a: snapshot the filename box BEFORE typing, so we can
+        // tell afterwards whether Ctrl+L actually moved focus away from it.
+        // UIA works cross-process; the old GetFocus() check did not (see fn doc).
+        let filename_before: Option<String> = best_edit.and_then(read_edit_value);
+
         let n = SendInputFn(&inputs, std::mem::size_of::<INPUT>() as i32);
         let total = inputs.len() as u32;
         if n != total {
             warn!(
-                "v0.5.5 SendInput: queued {total} events, system accepted only {n}; \
+                "v0.5.7 SendInput: queued {total} events, system accepted only {n}; \
                  foreground-lock likely blocked some events (Mavis D3)"
             );
             return false;
         }
         info!(
-            "v0.5.5 SendInput Ctrl+L + Home+Shift+End + path dispatched \
-             ({total} events, no Enter)"
+            "v0.5.7 SendInput Ctrl+L + Home+Shift+End + path dispatched ({total} events)"
         );
 
-        // Mavis I1 (第 16 轮): post-SendInput verify focused element.
-        // Confirms U-HK (Ctrl+L focused address bar, not 1001 Edit).
-        // If focused on filename box (1001), SendInput may have polluted
-        // filename — surface a warn so the user can see in spike.log.
-        let focused_hwnd = GetFocus();
-        if let Some(uia) = automation() {
-            if let Ok(elem) = uia.ElementFromHandle(focused_hwnd) {
-                let aid = current_automation_id(&elem);
-                let name = current_name(&elem);
-                info!(
-                    "v0.5.5 SendInput: post-SendInput focus aid='{aid}' name='{name}'"
-                );
-                if aid == "1001" || name.to_lowercase().contains("file name") {
-                    warn!(
-                        "v0.5.5 SendInput: focused on filename box (1001) — \
-                         SendInput may pollute filename. Consider H2 fallback."
-                    );
+        // v0.5.7 F-0 step 7b: read the filename box back.
+        let filename_after: Option<String> = best_edit.and_then(read_edit_value);
+
+        // Fail-safe: if we cannot read the box, assume the worst and skip Enter.
+        let path_landed_in_filename = path_landed_in_filename_box(
+            filename_before.as_deref(),
+            filename_after.as_deref(),
+        );
+
+        if path_landed_in_filename {
+            // Ctrl+L did NOT take effect (or we cannot prove it did). The path
+            // went into the FILENAME box. Pressing Enter there would activate
+            // the default button = Save — exactly the v0.5.1 regression
+            // ("下载直接启动"). Do not press Enter; undo our own pollution.
+            warn!(
+                "v0.5.7 H1: filename box changed (or unreadable) -> Ctrl+L did not \
+                 focus the address bar; SKIPPING Enter to avoid triggering Save"
+            );
+            if let (Some(edit), Some(before)) = (best_edit, filename_before.as_ref()) {
+                if write_edit_value(edit, before) {
+                    info!("v0.5.7 H1: restored filename box to '{before}' after Ctrl+L miss");
                 }
             }
+            // Return false so the caller falls through to H2, which is the
+            // no-foreground-dependency fallback.
+            return false;
+        }
+
+        // v0.5.7 F-0 step 8: filename box untouched => the path went to the
+        // address bar. Enter here performs NAVIGATION ONLY; it does not click
+        // Save. This is what makes the dialog actually jump to the folder.
+        //
+        // Small settle delay: the address bar needs a moment to receive the
+        // synthesized characters before Enter is interpreted. (Same order of
+        // magnitude as the 50ms gap H2 already uses between its two SetValue
+        // calls.)
+        std::thread::sleep(std::time::Duration::from_millis(80));
+
+        // ---- v0.5.7 F-0 guard 2: live focus check, evaluated AFTER typing ----
+        //
+        // Guard 1 proved the path did not land in the filename box.
+        // Guard 2 closes the remaining hole the user called out: focus could
+        // have jumped BACK to the filename box after typing. If it did, Enter
+        // would activate Save — the reverted v0.5.1 behaviour.
+        //
+        // Guard 2 does NOT gate on its own availability: if the focus query is
+        // indeterminate we allow Enter, because Guard 1 already proved the
+        // outcome. Blocking on an unavailable query would make the fix never
+        // fire, and Guard 1 is the stronger (outcome-based) evidence.
+        let focus_aid = foreground_focus_automation_id();
+        let focus_on_filename = match focus_aid.as_deref() {
+            Some(aid) => aid == "1001",
+            None => false, // indeterminate -> not treated as a block
+        };
+
+        if focus_on_filename {
+            warn!(
+                "v0.5.7 H1: keyboard focus is back on the filename box (aid=1001) \
+                 after typing; SKIPPING Enter to avoid triggering Save"
+            );
+            return true; // H1 did fill the address bar; user can press Enter
+        }
+
+        let enter_inputs: Vec<INPUT> = vec![
+            make_key(VK_RETURN as u16, 0),
+            make_key(VK_RETURN as u16, KEYEVENTF_KEYUP.0),
+        ];
+        let en = SendInputFn(&enter_inputs, std::mem::size_of::<INPUT>() as i32);
+        if en as u32 != enter_inputs.len() as u32 {
+            warn!(
+                "v0.5.7 SendInput: Enter queued 2 events, system accepted {en}; \
+                 address bar left filled but not navigated (user can press Enter)"
+            );
+        } else {
+            info!(
+                "v0.5.7 H1 committed: Enter sent to address bar \
+                 (navigation only — Save still requires the user); focus_aid={focus_aid:?}"
+            );
         }
 
         true
@@ -531,7 +729,7 @@ pub fn inject_folder_path(
     warn!("COM SetFolder unavailable; falling back to UIA.");
 
     // Stage 2: UIA fallback (Sep 27 PathWrap design).
-    match inject_via_uia(dialog_hwnd, target_path, should_commit) {
+    match inject_via_uia(state, dialog_hwnd, target_path, should_commit) {
         Ok(()) => {
             info!("Injection succeeded via UI Automation.");
             DialogOutcome::AddressBarWritten
@@ -562,6 +760,7 @@ pub fn inject_folder_path(
 ///   F4 — return Unsupported (the caller maps this to a
 ///        `unsupported_dialog_count` bump and a user notification).
 fn inject_via_uia(
+    state: &crate::state::AppState,
     dialog_hwnd: u32,
     target_path: &str,
     should_commit: bool,
@@ -638,20 +837,22 @@ fn inject_via_uia(
              entering 4-layer fallback chain"
         );
 
-        // H1 — SendInput Ctrl+L + path (NO Enter, NO 1001 Edit touch).
+        // H1 — SendInput Ctrl+L + path, then GUARDED Enter (v0.5.7 F-0).
+        // The guard reads the filename box back after typing; Enter is only
+        // sent when the path provably went to the address bar, so it can only
+        // ever NAVIGATE. It never invokes the Save button. This is what
+        // separates v0.5.7 from the reverted v0.5.1 "直接启动下载" behaviour.
         // v0.5.1 (2026-10-05): user feedback "下载启动后,跳过了路径选择步骤,
-        // 直接启动下载". The Enter + commit_save_button combo auto-triggered
-        // the save. Now we just set the address bar text and let the user
-        // navigate manually (click tree view, press Enter, click Save).
-        if try_send_path_via_sendinput(dialog_hwnd, target_path) {
-            info!("v0.5.1 H1 succeeded: SendInput Ctrl+L set address bar (user navigates + saves manually)");
-            // v0.5.1: NEVER auto-Invoke Save after H1. The user explicitly
-            // requested manual confirmation. Even if should_commit=true,
+        // 直接启动下载" — that was Enter + commit_save_button with no guard.
+        // Both were removed. We re-add ONLY the guarded, guarded-only Enter.
+        if try_send_path_via_sendinput(state, dialog_hwnd, target_path, best_edit.as_ref()) {
+            info!("v0.5.7 H1 succeeded: address bar set + Enter sent (navigate only)");
+            // v0.5.1: NEVER auto-Invoke Save after H1. Even if should_commit=true,
             // we do not commit. (Future: maybe re-enable should_commit if
             // a new "trusted auto-confirm" user setting is added.)
             return Ok(());
         }
-        warn!("v0.5.1 H1 failed: SendInput did not reach the dialog (foreground lock?)");
+        warn!("v0.5.7 H1 failed: SendInput did not reach the dialog, or Ctrl+L missed the address bar (foreground lock?)");
 
         // H2 — write target_path then restore the original filename.
         // v0.5.1 (2026-10-05): user wants manual confirmation. Do not
@@ -801,6 +1002,53 @@ fn fallback_confirm(edit: &IUIAutomationElement) {
     }
 }
 
+#[cfg(test)]
+mod f0_guard_tests {
+    use super::path_landed_in_filename_box;
+
+    /// Safety property: Ctrl+L worked => the filename box is UNCHANGED =>
+    /// Enter is safe (it navigates the address bar).
+    #[test]
+    fn unchanged_filename_box_is_safe_to_press_enter() {
+        assert!(!path_landed_in_filename_box(Some("report.xlsx"), Some("report.xlsx")));
+    }
+
+    /// Ctrl+L failed => the path was typed into the FILENAME box => Enter
+    /// there would activate the Save button (the reverted v0.5.1 regression).
+    /// Must refuse.
+    #[test]
+    fn changed_filename_box_blocks_enter() {
+        assert!(path_landed_in_filename_box(
+            Some("report.xlsx"),
+            Some("E:\\resource")
+        ));
+    }
+
+    /// Fail-safe: unreadable before-snapshot => refuse Enter.
+    #[test]
+    fn unreadable_before_snapshot_blocks_enter() {
+        assert!(path_landed_in_filename_box(None, Some("report.xlsx")));
+    }
+
+    /// Fail-safe: unreadable after-snapshot => refuse Enter.
+    #[test]
+    fn unreadable_after_snapshot_blocks_enter() {
+        assert!(path_landed_in_filename_box(Some("report.xlsx"), None));
+    }
+
+    /// Fail-safe: both unreadable => refuse Enter.
+    #[test]
+    fn both_unreadable_blocks_enter() {
+        assert!(path_landed_in_filename_box(None, None));
+    }
+
+    /// Empty original filename is a real case (fresh Save As dialog).
+    #[test]
+    fn empty_original_filename_still_detected() {
+        assert!(!path_landed_in_filename_box(Some(""), Some("")));
+        assert!(path_landed_in_filename_box(Some(""), Some("E:\\x")));
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;

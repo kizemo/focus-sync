@@ -1,112 +1,156 @@
 /**
- * Focus Sync v0.5.5 — Sigma FM extension entry point.
+ * Focus Sync — Sigma FM extension entry point.
  *
- * v0.5.5 (2026-10-06) — 1 line return false fix:
- *   - v0.5.4 GetForegroundWindow check was warn + continue (silent race condition fail).
- *   - v0.5.5 abort: if dialog not foreground, return false → trigger H2 (UIA SetValue).
- *   - H2 works without foreground; UIA SetValue does not require foreground window.
- *   - 50ms flicker between SetValue target_path and SetValue original_filename.
- *
- * v0.5.4 (2026-10-05) — Home+Shift+End fix + I1 verify:
- *   - Ctrl+A 不 work in WinUI 3 wrapped Save As (WinUI 3 intercepts).
- *   - Fix: SendInput uses Ctrl+L + Home + Shift+End (basic Edit ops).
- *   - I1: post-SendInput focus verify (GetFocus + UIA) detects pollution.
- *
- * v0.5.2 (2026-10-05) — Ctrl+A fix for address bar concatenation:
- *   - Ctrl+A 也不 work in WinUI 3 wrapped Save As (WinUI 3 intercepts).
- *   - v0.5.4 改用 Home + Shift+End(基本 Edit 操作,WinUI 3 不太可能拦截)。
- *
- * v0.5.1 (2026-10-05) — Ctrl+L path works + Rule 47 (no auto-Save):
- *   - 4-layer fallback: COM SetFolder / H1 SendInput / H2 write+restore / F3 v0.5.0
- *
- * v0.5.0 (2026-10-04) — Sep 27 baseline rollback (dual-role bug):
- *   - uia_inject.rs 重写为 Sep 27 简单逻辑
- *
- * v0.4.0 撤回(用户反馈 "rollback to manual deployment success"):
- *   v0.4.0 加了 8+ 个 helper 和 address bar fallback,在 WinUI 3 wrapped
- *   dialog 上返回 Unsupported(什么都不做)。Sep 27 简单代码反而 work。
- *
- * v0.3.9 撤回:is_winui3_wrapped 检测是 regression(把 v0.3.8 working 的
- *   Edge WinUI 3 dialog 直接 skip)。
- *
- * 用户接受 trade-off (Sep 27 era):filename 字段可能显示路径 2-6 秒后 dialog
- * 自动关闭。这是 Sep 27 spike-report PASS 的核心行为。
- *
- * v0.3.8 (focus-21 + Mavis 10th-round A4-A9 review) — 沿用其 should_commit=true
- *   默认 + 1001/1148 helper,但 v0.5.0 简化了所有验证步骤。
- *
- * v0.3.7 (focus-21 + Mavis 8th-round L1 review) — REAL ROOT-CAUSE FIX:
- *   5+ rounds of focus-sync fixes failed because focus-20/21 wrote the
- *   target path to the WinUI filename edit and the user repeatedly
- *   rejected "filename STILL being modified" as visual pollution.
- *   v0.3.6 aligns with the user's stated preference: focus-sync EITHER
- *   fully navigates the dialog (Chromium 41477 branch) OR it does nothing.
- *   For WinUI Save As (no 41477, no SetFolder, has Edit element) the
- *   sidecar now returns `Unsupported` and bumps the counter; the extension
- *   shows a clear "enable edge://flags/#edge-legacy-file-picker" tip.
- *   The user keeps full control of the filename field.
- *
- * v0.3.5 (focus-21 + Mavis 7th-round review) additions over v0.3.4:
- *   - 30s boot grace period (N2 fix): after activate(), suppress error/warning
- *     notifications for 30s to prevent the "Sidecar not reachable" /
- *     "unsupported_dialog_count changed" cascade that was overwhelming
- *     first-time users. Edge tip itself remains ungated (critical info).
- *   - resetEdgeTip now immediately re-shows the tip (N5 fix) instead of
- *     asking the user to restart Sigma FM. Duration bumped to 12s.
- *   - loadBool helper (N7 fix): unified try/catch + default-value storage
- *     reads for enabled / autoConfirm / edgeLegacyFilePickerTipShown.
- *
- * v0.3.4 (focus-21) additions:
- *   - Toolbar menu item "🔁 Re-show Edge tip" (Bug B fix). Resets the
- *     `edgeLegacyFilePickerTipShown` flag so users who missed the
- *     one-time notification (or whose duration expired) can re-trigger
- *     it via Sigma FM's toolbar without re-installing.
- *   - Initial ping delayed 5s (Bug C fix). Scheduled Task mode means the
- *     sidecar may take a few seconds to come up; without the delay, users
- *     see "Sidecar not reachable" right next to the Edge tip notification,
- *     causing panic on first activation.
- *   - Edge tip duration 25s → 8s (P3 improvement §10.2). 25s was too long;
- *     the toolbar reset button (above) is the durable entry, not the long toast.
- *
- * v0.3.3 (focus-20) additions:
- *   - One-time Edge legacy file picker tip shown on first activate
- *     (`edgeLegacyFilePickerTipShown` storage flag). Educates user about
- *     `edge://flags/#edge-legacy-file-picker` which makes Edge use the
- *     classic IFileDialog and gives focus-sync full path-sync support.
- *     Per retrospective review §2.2 [P0-2]: this is the PRIMARY workaround
- *     for Edge Modern Save As (WinUI 3 in Win11 22H2+).
- *
- * v0.3.2 (focus-19) additions:
- *   - Polls /health for `unsupported_dialog_count` (a new focus-19 metric).
- *     When the count increases since the last poll AND >= 5 minutes have
- *     elapsed since the last notification, shows a "this dialog isn't
- *     supported" notification so the user understands why their Save As
- *     navigation didn't happen.
- *   - Deep-analysis §4.2 Option B (short-term WinUI Save As fix): sidecar
- *     returns Unsupported instead of polluting the filename field.
- *
- * v0.3.1 (focus-18) additions:
- *   - `autoConfirm` state (default false): when true, sidecar Invoke Save
- *     once per dialog session. Toolbar menu "Auto-Confirm" toggles this.
- *   - pushNow body adds `auto_confirm: autoConfirm` field; sidecar SetPathBody
- *     serde-deserializes with #[serde(default)] so legacy callers without
- *     the field still work (treated as auto_confirm=false).
- *
- * v0.3.0 architecture (Scheduled Task mode):
- *   - Sidecar is launched by Windows Task Scheduler at user logon, NOT by
- *     Sigma FM. Extension does NOT spawn the sidecar.
- *   - Extension only does HTTP health-check via sigma.http.request to
- *     127.0.0.1:37421/health, and POST /set_path on path change.
- *   - No need for sidecar binary path — HTTP IPC has no path dependency.
- *
- * Sandbox notes:
- *   - `fetch` is intercepted by Sigma FM extension sandbox (regex match).
- *     Use `sigma.http.request` (manifest `http` permission) instead.
- *   - `setInterval` may be sandbox-blocked in some scenarios. Use chain of
- *     setTimeout as a defensive fallback.
- *   - `sigma.fs.stat` / `sigma.registry.read` do NOT exist — we do NOT
- *     discover sidecar binary path; HTTP ping is path-independent.
+ * Sends the active folder to a local sidecar process over HTTP.
+ * Sandbox constraints: see scripts/scan-sandbox-dynamic.cjs
+ * Changelog: docs/extension-changelog.md (NOT in this file — comments are sandbox-scanned)
  */
+
+// ============================================================================
+// DIAGNOSTIC TRACE (focus-21 Phase 5, 2026-10-07)
+// ============================================================================
+// Purpose: every debug session must be able to answer "which node broke?"
+// from PERSISTENT evidence, not from a DevTools console that is gone after restart.
+//
+// Storage: sigma.storage (customSettings key) — no manifest permission required.
+// Read it back with:  powershell -File scripts\read-focus-trace.ps1
+//
+// WHY NUMBERS, NOT STRINGS: the live bug under investigation is a mojibake
+// (UTF-8 bytes decoded as GBK). Storing the raw string would let the very bug
+// we are chasing corrupt the evidence. So for every path-bearing node we also
+// store UTF-16 code units as NUMBERS, which survive any charset round-trip.
+// Offline, [System.Text.Encoding]::GetEncoding(936) can then decide, with
+// certainty, whether the received text is genuine or GBK-mojibake.
+// ============================================================================
+
+const TRACE_KEY = '__focus_sync_trace';
+const TRACE_MAX = 300;
+const TRACE_FLUSH_MS = 800;
+const TRACE_SESSION = 's' + Date.now().toString(36);
+
+/**
+ * v0.5.7 G-7 — decode an HTTP response body that is NOT a string.
+ *
+ * `sigma.http.request` returns `{ok, status, headers, body}` where `body` is a
+ * **Uint8Array**, not a string. `JSON.parse()` on it coerces via `String()`,
+ * producing "123,34,115,116,..." — JSON.parse reads `123` as a complete number
+ * and dies at the first comma:
+ *
+ *   SyntaxError: Unexpected non-whitespace character after JSON at position 3
+ *
+ * That throw made `parsed` ALWAYS null in checkHealth(), so the whole
+ * unsupported-count notification path — and the G-6 restart re-push — never
+ * ran. This is the root cause of "the dialog jumps to a stale Sigma path":
+ * the sidecar kept whatever path it had last received.
+ */
+function decodeHttpBody(b) {
+    if (b === null || b === undefined) return '';
+    if (typeof b === 'string') return b;
+    try {
+        // ArrayBuffer.isView covers EVERY typed-array view (Uint8Array,
+        // Uint16Array, DataView, ...) and, unlike `instanceof`, keeps working
+        // across the worker/main-window realm boundary that structured clone
+        // creates. The first attempt at this fix used `b instanceof Uint8Array`
+        // and it did NOT match in the worker.
+        if (typeof ArrayBuffer !== 'undefined' && ArrayBuffer.isView(b)) {
+            return new TextDecoder('utf-8').decode(
+                new Uint8Array(b.buffer, b.byteOffset, b.byteLength)
+            );
+        }
+        if (typeof ArrayBuffer !== 'undefined' && b instanceof ArrayBuffer) {
+            return new TextDecoder('utf-8').decode(new Uint8Array(b));
+        }
+        if (Array.isArray(b)) {
+            return new TextDecoder('utf-8').decode(new Uint8Array(b));
+        }
+        if (typeof b === 'object') {
+            // axios-style envelopes, in case the client shape changes.
+            if (b.data !== undefined) return decodeHttpBody(b.data);
+            if (b.body !== undefined) return decodeHttpBody(b.body);
+        }
+    } catch (e) {
+        return '';
+    }
+    return String(b);
+}
+
+/** Human-readable runtime type of a value, safe to log. */
+function typeTag(v) {
+    if (v === null) return 'null';
+    if (v === undefined) return 'undefined';
+    const t = typeof v;
+    if (t !== 'object') return t;
+    try { return Object.prototype.toString.call(v).slice(8, -1); } catch (e) { return 'object?'; }
+}
+
+let traceBuf = [];
+let traceDirty = false;
+let traceTimer = null;
+let traceSeq = 0;
+
+/** UTF-16 code-unit fingerprint — encoding-immune evidence. */
+function traceFingerprint(s) {
+    if (typeof s !== 'string') return { type: typeof s, value: String(s) };
+    const n = Math.min(s.length, 32);
+    const codes = [];
+    for (let i = 0; i < n; i++) codes.push(s.charCodeAt(i));
+    let nonAscii = false;
+    for (let i = 0; i < s.length; i++) {
+        if (s.charCodeAt(i) > 127) { nonAscii = true; break; }
+    }
+    return { len: s.length, nonAscii: nonAscii, codes: codes };
+}
+
+function traceFlushNow() {
+    if (!traceDirty) return Promise.resolve();
+    traceDirty = false;
+    if (traceTimer !== null) { clearTimeout(traceTimer); traceTimer = null; }
+    try {
+        return Promise.resolve(sigma.storage.set(TRACE_KEY, traceBuf.slice(-TRACE_MAX)))
+            .catch(() => {});
+    } catch (e) {
+        // storage unavailable — trace is best-effort, must never break sync.
+        return Promise.resolve();
+    }
+}
+
+/** node: stable short ID. detail: must be JSON-serialisable and SMALL. */
+function trace(node, detail) {
+    try {
+        traceSeq += 1;
+        const entry = { seq: traceSeq, t: new Date().toISOString(), s: TRACE_SESSION, node: node };
+        if (detail) {
+            for (const k in detail) {
+                if (Object.prototype.hasOwnProperty.call(detail, k)) entry[k] = detail[k];
+            }
+        }
+        traceBuf.push(entry);
+        if (traceBuf.length > TRACE_MAX) traceBuf = traceBuf.slice(-TRACE_MAX);
+        traceDirty = true;
+        // Throttled flush; also flushed explicitly at completion nodes.
+        if (traceTimer === null) {
+            traceTimer = setTimeout(() => { traceTimer = null; traceFlushNow(); }, TRACE_FLUSH_MS);
+        }
+    } catch (e) { /* never let diagnostics break the product */ }
+}
+
+/** Report whether sigma.storage is usable at all — N02 depends on it. */
+async function traceProbeStorage() {
+    let ok = false;
+    let err = null;
+    try {
+        const probe = '__probe_' + Date.now();
+        await sigma.storage.set(probe, 1);
+        const back = await sigma.storage.get(probe);
+        await sigma.storage.remove(probe);
+        ok = (back === 1);
+    } catch (e) {
+        err = String(e).slice(0, 120);
+    }
+    trace('N02.storage.probe', { ok: ok, err: err });
+    return ok;
+}
+
 
 const SIDECAR_HTTP = 'http://127.0.0.1:37421';
 const HEALTH_CHECK_INTERVAL_MS = 15_000;
@@ -142,6 +186,14 @@ let notifiedSinceLastFailure = false;
 // the baseline and never notifies.
 let lastUnsupportedDialogCount = -1;
 let lastUnsupportedNotifyTs = 0;
+// v0.5.7 G-6: last path Sigma FM told us about.
+// The sidecar forgets everything on restart (current_path = "", first_push_received
+// = false) but we only push on path CHANGE, so after a sidecar restart nothing is
+// ever pushed until the user happens to navigate. A download dialog opened during
+// that window finds nothing to sync ("sentinel; skipping until first push
+// received", 2026-10-07 22:49). checkHealth() re-pushes from this when it sees
+// the sidecar has never received a path.
+let lastKnownPath = null;
 
 function normalizePath(p) {
     if (typeof p !== 'string') return p;
@@ -158,8 +210,12 @@ function schedulePush(path) {
 }
 
 async function pushNow(path) {
-    if (!enabled) return;
+    if (!enabled) {
+        trace('N07.push.skip', { why: 'disabled', fp: traceFingerprint(path) });
+        return;
+    }
     const normalized = normalizePath(path);
+    trace('N06.push.normalized', { rawFp: traceFingerprint(path), normFp: traceFingerprint(normalized) });
     console.log('[focus-sync] PUSH raw=' + JSON.stringify(path) + ' normalized=' + JSON.stringify(normalized));
 
     try {
@@ -168,16 +224,22 @@ async function pushNow(path) {
         // Now that the sidecar is independent of Sigma FM lifecycle, the
         // push either works (sidecar alive) or doesn't (sidecar down).
         // Retries would just spam the dying sidecar. One shot, log if failed.
+        const body = JSON.stringify({ path: normalized, auto_confirm: autoConfirm });
+        trace('N07.push.req', { bodyFp: traceFingerprint(normalized), bodyLen: body.length });
         const r = await sigma.http.request({
             url: `${SIDECAR_HTTP}/set_path`,
             method: 'POST',
             headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({ path: normalized, auto_confirm: autoConfirm }),
+            body: body,
         });
+        trace('N08.push.resp', { status: r.status });
         console.log('[focus-sync] PUSH response status=' + r.status);
+        traceFlushNow();
     } catch (e) {
+        trace('N09.push.err', { msg: String(e).slice(0, 160) });
         console.warn('[focus-sync] push failed:', String(e).slice(0, 200));
         // Notification handled by health check; don't double-notify here.
+        traceFlushNow();
     }
 }
 
@@ -186,20 +248,23 @@ async function pushNow(path) {
  * Returns true if sidecar is reachable and healthy, false otherwise.
  */
 async function pingSidecar() {
+    trace('N03.health.req', { t: 0 });
     try {
         const r = await sigma.http.request({
             url: `${SIDECAR_HTTP}/health`,
             method: 'GET',
             timeout: HEALTH_CHECK_TIMEOUT_MS,
         });
+        trace('N04.health.resp', { status: r.status });
         if (r.status !== 200) return false;
-        const body = JSON.parse(r.body || '{}');
+        const body = JSON.parse(decodeHttpBody(r.body) || '{}');
         // v0.3.0: status field semantics
         //   "ok"       → fully operational
         //   "degraded" → process alive but UIA may be broken or session 0
         //   "down"     → unreachable
         return body.status !== 'down' && body.status !== undefined;
     } catch (e) {
+        trace('N04.health.err', { msg: String(e).slice(0, 160) });
         return false;
     }
 }
@@ -228,14 +293,59 @@ async function checkHealth() {
 
     // focus-19: parse unsupported_dialog_count and notify on increase.
     let parsed = null;
-    try { parsed = JSON.parse(r.body); } catch (e) { parsed = null; }
-    if (parsed && typeof parsed.unsupported_dialog_count === 'number') {
+    try {
+        parsed = JSON.parse(decodeHttpBody(r.body));
+        // Successful parses are NOT traced: health polls every 15s would flush the ring
+    } catch (e) {
+        parsed = null;
+        // N12 — parse failure silently disables the ENTIRE unsupported-count
+        // notification block below. That is why "dialog not supported" can
+        // never fire when the body is unparseable. Fingerprint the raw body
+        // so we can see exactly what the http client handed us.
+        trace('N12.health.parse.err', {
+            msg: String(e).slice(0, 200),
+            bodyLen: (typeof r.body === 'string' ? r.body.length : -1),
+            bodyFp: traceFingerprint(r.body),
+        });
+    }
+    // v0.5.7 G-6: re-push after a sidecar restart.
+        //
+        // The sidecar clears `current_path` and `first_push_received` on every
+        // start, but we only push on path CHANGE. So after a sidecar restart
+        // (deploy, crash, logon) it can sit with no path until the user happens
+        // to navigate — and any download dialog opened in that window has
+        // nothing to sync. Observed 2026-10-07 22:49:57:
+        //   "dialog path='11.politics' current='' (sentinel); skipping until
+        //    first push received"
+        //
+        // checkHealth() already polls /health every 15s, so re-push from here
+        // when the sidecar reports it has never received a path. Self-healing,
+        // no extra endpoint, no user action needed.
+        if (parsed && parsed.first_push_received === false && lastKnownPath) {
+            trace('N15.repush.after_restart', { path: lastKnownPath });
+            schedulePush(lastKnownPath);
+        }
+
+        if (parsed && typeof parsed.unsupported_dialog_count === 'number') {
         const newCount = parsed.unsupported_dialog_count;
+        const now = Date.now();
+        // N13 — record the notification DECISION explicitly. Previously the
+        // only reason "dialog not supported" never appeared was invisible:
+        // every early-return below was silent.
+        trace('N13.notify.decide', {
+            baseline: lastUnsupportedDialogCount,
+            current: newCount,
+            increased: newCount > lastUnsupportedDialogCount,
+            inGrace: inGracePeriod(),
+            throttleLeftMs: Math.max(0, UNSUPPORTED_NOTIFY_THROTTLE_MS - (now - lastUnsupportedNotifyTs)),
+            willNotify: (newCount > lastUnsupportedDialogCount)
+                && !inGracePeriod()
+                && (now - lastUnsupportedNotifyTs >= UNSUPPORTED_NOTIFY_THROTTLE_MS),
+        });
         if (lastUnsupportedDialogCount === -1) {
             // First observation: establish baseline, never notify.
             lastUnsupportedDialogCount = newCount;
         } else if (newCount > lastUnsupportedDialogCount) {
-            const now = Date.now();
             // v0.3.5 (Mavis N2): suppress during boot grace period so
             // first-activation UX isn't a cascade of banners.
             if (!inGracePeriod() && now - lastUnsupportedNotifyTs >= UNSUPPORTED_NOTIFY_THROTTLE_MS) {
@@ -250,8 +360,16 @@ async function checkHealth() {
                         type: 'warning',
                         duration: 8000,
                     });
-                } catch (e) {}
+                    trace('N14.notify.shown', { delta: newCount - lastUnsupportedDialogCount });
+                } catch (e) {
+                    trace('N14.notify.err', { msg: String(e).slice(0, 200) });
+                }
                 lastUnsupportedNotifyTs = now;
+            } else {
+                trace('N14.notify.suppressed', {
+                    inGrace: inGracePeriod(),
+                    waitMs: now - lastUnsupportedNotifyTs,
+                });
             }
             lastUnsupportedDialogCount = newCount;
         }
@@ -271,9 +389,17 @@ async function pingSidecarWithBody() {
             method: 'GET',
             timeout: HEALTH_CHECK_TIMEOUT_MS,
         });
+        trace('N03.health.resp', {
+            status: r.status,
+            keys: Object.keys(r).join(','),
+            bodyType: typeTag(r.body),
+            bodyLen: (typeof r.body === 'string' ? r.body.length : -1),
+            bodyFp: traceFingerprint(r.body),
+        });
         if (r.status !== 200) return null;
         return r;
     } catch (e) {
+        trace('N04.health.err', { msg: String(e).slice(0, 200) });
         // Transport failure: notify on first occurrence (banner pattern).
         // v0.3.5 (Mavis N2): suppress during boot grace period so the
         // banner doesn't fire next to the Edge tip during first activation.
@@ -434,7 +560,9 @@ async function resetEdgeTip() {
 const activate = async () => {
     // v0.3.5 (Mavis N2): stamp boot start so the 30s grace period gate works.
     bootStartedAt = Date.now();
+    trace('N01.activate.start', { ver: 'v0.5.5', traceSession: TRACE_SESSION });
     console.log('[focus-sync] v0.5.5 activate START (H1 SendInput abort if !foreground + H2 UIA SetValue fallback + L1 .no_proxy() + find_ifiledialog_edit 1001/1148 + should_commit=true (unused per Rule 47) + verify + path tolerance)');
+    void traceProbeStorage();
     try { await sigma.i18n.mergeFromPath('locales'); } catch (e) {}
     // v0.3.5 (N7): unified loadBool for storage reads. Was 2 inline try/catch
     // blocks; Bug B reset adds a 3rd (`edgeLegacyFilePickerTipShown`).
@@ -559,17 +687,34 @@ const activate = async () => {
     try {
         sigma.context.onPathChange((path) => {
             console.log('[focus-sync] onPathChange raw=' + JSON.stringify(path));
-            if (path) schedulePush(path);
+            // N05 — THE decisive node for the mojibake investigation.
+            // Records what Sigma FM hands us, before ANY normalisation.
+            trace('N05.path.raw', { src: 'onPathChange', fp: traceFingerprint(path) });
+            if (path) {
+                lastKnownPath = normalizePath(path);
+                schedulePush(path);
+            }
         });
-    } catch (e) {}
+    } catch (e) {
+        trace('N05.path.err', { msg: String(e).slice(0, 160) });
+    }
 
     try {
         const initialPath = await sigma.context.getCurrentPath();
-        if (initialPath) schedulePush(normalizePath(initialPath));
-    } catch (e) {}
+        trace('N10.ctx.initialPath', { fp: traceFingerprint(initialPath) });
+        if (initialPath) {
+            lastKnownPath = normalizePath(initialPath);
+            schedulePush(initialPath);
+        }
+    } catch (e) {
+        trace('N10.ctx.err', { msg: String(e).slice(0, 160) });
+    }
+    traceFlushNow();
 };
 
 const deactivate = async () => {
+    trace('N11.deactivate', {});
+    await traceFlushNow();
     if (pushTimer !== null) { clearTimeout(pushTimer); pushTimer = null; }
     stopHealthCheck();
     // v0.3.0: do NOT call /quit — the sidecar is owned by Task Scheduler,

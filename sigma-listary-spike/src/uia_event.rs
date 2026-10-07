@@ -43,6 +43,22 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use windows::core::BOOL;
 use windows::core::w;
 
+/// v0.5.7 G-1 — pure decision function for "should a KNOWN dialog re-sync?".
+///
+/// `known_same`  : the monitor is already tracking this exact hwnd
+///                 (so the round-18 dedup would suppress an `Opened`).
+/// `pending`     : path most recently pushed by the extension.
+/// `last_written`: what we last wrote into this dialog.
+///
+/// LOOP SAFETY: once a write-back happens, main.rs sets
+/// `DialogInfo.last_known_path = state.current_path()`, so on the very next
+/// 8ms tick `last_written == pending` and this returns false. Without that,
+/// the monitor would push `Opened` every tick — the exact flash loop the
+/// round-18 dedup was added to prevent.
+fn should_resync_known_dialog(known_same: bool, pending: &str, last_written: Option<&str>) -> bool {
+    known_same && !pending.is_empty() && last_written != Some(pending)
+}
+
 /// Information about a detected file dialog.
 #[derive(Debug, Clone)]
 pub struct DialogInfo {
@@ -165,7 +181,19 @@ fn start_event_wakeup_hook() -> Receiver<()> {
 
 /// Synchronous blocking monitor loop. Run via `tokio::task::spawn_blocking`.
 /// Emits detected `DialogEvent` via `sender` and wakes main tokio loop via `notify.notify_one()`.
-pub fn start_monitor(sender: Sender<DialogEvent>, notify: Arc<Notify>) {
+/// v0.5.7 F-1 — signature change: takes `state` so the monitor thread can
+/// publish the foreground dialog HWND into shared state.
+///
+/// WHY: this thread is the ONLY one whose foreground observation is reliable.
+/// It pumps Windows messages (`GetMessageW`/`DispatchMessageW`), so
+/// `GetForegroundWindow()` returns the true foreground window here. The HTTP
+/// server thread has no message pump and its answers disagreed with this
+/// thread's — which made `/set_path` defer every push (2026-10-07 16:39).
+pub fn start_monitor(
+    sender: Sender<DialogEvent>,
+    notify: Arc<Notify>,
+    state: Arc<crate::state::AppState>,
+) {
     const INVALID_HWND: isize = 0;
     const IDLE_POLL_INTERVAL_MS: u64 = 30;
     const TRACKING_POLL_INTERVAL_MS: u64 = 8;
@@ -175,20 +203,86 @@ pub fn start_monitor(sender: Sender<DialogEvent>, notify: Arc<Notify>) {
     let mut last_hwnd: isize = INVALID_HWND;
     let mut last_foreground_signature: Option<String> = None;
     let mut lost_ticks: u8 = 0;
+    // v0.5.7 G-3: source-side rate limit.
+    //
+    // The G-2 `sync_in_progress` guard is set by main WHEN IT STARTS handling an
+    // event, which is too late: the monitor keeps polling every 8ms while a
+    // ~300ms write is queued but not yet started, and mpsc has no backpressure.
+    // Observed 2026-10-07 21:57: 24 resyncs queued in 320ms -> the address bar
+    // accumulated the path ~24 times and the dialog died mid-injection with
+    // RPC_E_DISCONNECTED (0x80010108).
+    //
+    // Rate-limiting AT THE SOURCE bounds the backlog to one pending event.
+    let mut last_resync_at: Option<Instant> = None;
+    let resync_cooldown = Duration::from_millis(1200);
 
     loop {
         let loop_started = Instant::now();
         let current_dialog = get_active_file_dialog();
 
+        // v0.5.7 F-1: publish the authoritative foreground answer for the rest
+        // of the process. `0` = no foreground file dialog.
+        state.set_foreground_dialog(
+            current_dialog
+                .as_ref()
+                .map(|d| d.hwnd as u32)
+                .unwrap_or(0),
+        );
+
         if let Some(info) = current_dialog {
             lost_ticks = 0;
             let (should_push, next_last_hwnd) = dedup_opened(last_hwnd, &info);
-            if should_push {
-                debug!(
-                    "[monitor] dialog detected: hwnd={} rect=({}, {}) {}x{}",
-                    info.hwnd, info.x, info.y, info.width, info.height
-                );
+
+            // v0.5.7 G-1 (2026-10-07): re-sync a KNOWN dialog when the user
+            // brings it back to the foreground and a newer path is pending.
+            //
+            // WITHOUT THIS the round-18 dedup (which suppresses repeat `Opened`
+            // for an unchanged hwnd, added to stop the 8ms flash loop) also
+            // suppressed every legitimate re-sync. Observed 2026-10-07:
+            //   21:14:32 dialog detected, synced to E:\resource   (OK)
+            //   21:20:07 user navigates Sigma FM to E:\obsidian -> /set_path
+            //           defers (correct: user owns focus)
+            //   user clicks back to the dialog -> dedup sees the same hwnd ->
+            //           NO Opened event -> the deferred sync never runs.
+            //
+            // The dedup key is `DialogInfo.last_known_path`, which main.rs
+            // updates to `state.current_path` right after a write-back
+            // (unconditionally, which is what breaks any push loop).
+            // `current_path.is_empty()` guards the pre-first-push window where
+            // there is nothing meaningful to sync.
+            let hwnd_u32 = info.hwnd as u32;
+            let pending = state.get_current_path();
+            let last_written = state.last_written_path(hwnd_u32);
+            let known_same = last_hwnd == info.hwnd as isize;
+            let cooldown_ok = last_resync_at
+                .map(|t| t.elapsed() >= resync_cooldown)
+                .unwrap_or(true);
+            let should_resync = should_resync_known_dialog(
+                known_same,
+                &pending,
+                last_written.as_deref(),
+            ) && !state.sync_in_progress()
+                && cooldown_ok;
+
+            if should_push || should_resync {
+                if should_push {
+                    debug!(
+                        "[monitor] dialog detected: hwnd={} rect=({}, {}) {}x{}",
+                        info.hwnd, info.x, info.y, info.width, info.height
+                    );
+                } else {
+                    debug!(
+                        "[monitor] dialog regained foreground with pending path \
+                         change (hwnd={}, pending='{}', last_written='{}') -> resync",
+                        info.hwnd,
+                        pending,
+                        state.last_written_path(hwnd_u32).unwrap_or_default()
+                    );
+                }
                 last_hwnd = next_last_hwnd;
+                if should_resync && !should_push {
+                    last_resync_at = Some(Instant::now());
+                }
                 // Round 18: only push when hwnd actually changes — previously the
                 // 8ms polling loop pushed every tick, causing main to re-write the
                 // filename box continuously (flash loop). PathWrap upstream does
@@ -464,6 +558,59 @@ fn dedup_opened(last_hwnd: isize, info: &DialogInfo) -> (bool, isize) {
     }
 }
 
+#[cfg(test)]
+mod g1_resync_tests {
+    use super::should_resync_known_dialog;
+
+    /// The bug this fixes: user navigates in Sigma FM, path is deferred, then
+    /// brings the SAME dialog back to the foreground. The round-18 dedup would
+    /// suppress the Opened event -> sync never runs.
+    #[test]
+    fn known_dialog_with_new_pending_path_resyncs() {
+        assert!(should_resync_known_dialog(
+            true,
+            "E:\\obsidian",
+            Some("E:\\resource")
+        ));
+    }
+
+    /// LOOP SAFETY (critical): after a write-back main.rs sets
+    /// last_known_path = current_path, so the next 8ms tick must NOT push.
+    /// Pushing here every tick is the round-17 flash loop.
+    #[test]
+    fn already_written_path_does_not_resync_again() {
+        assert!(!should_resync_known_dialog(
+            true,
+            "E:\\obsidian",
+            Some("E:\\obsidian")
+        ));
+    }
+
+    /// Pre-first-push window: current_path is "" (Fix F). Nothing to sync and
+    /// pushing would re-trigger the sentinel path forever.
+    #[test]
+    fn empty_pending_never_resyncs() {
+        assert!(!should_resync_known_dialog(true, "", Some("")));
+        assert!(!should_resync_known_dialog(true, "", None));
+    }
+
+    /// Unknown dialog -> the normal `should_push` path handles it.
+    #[test]
+    fn unknown_dialog_is_not_a_resync() {
+        assert!(!should_resync_known_dialog(
+            false,
+            "E:\\obsidian",
+            Some("E:\\resource")
+        ));
+    }
+
+    /// Never written to (not in registry) + a pending path -> resync, otherwise
+    /// a dialog that was registered but never written would never sync.
+    #[test]
+    fn never_written_dialog_with_pending_path_resyncs() {
+        assert!(should_resync_known_dialog(true, "E:\\tmp", None));
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;

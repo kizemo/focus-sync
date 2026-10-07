@@ -43,6 +43,36 @@ $appDataDir    = Join-Path $resolvedAppData 'com.sigma-file-manager.app'
 $userDataDir   = Join-Path $appDataDir 'user-data'
 $jsonPath      = Join-Path $userDataDir 'user-extensions.json'
 
+# ---- Sandbox gate (focus-21 Phase 4) ----
+# register.ps1 does not copy index.js itself (installer.nsi copies the files
+# before invoking this script), so we validate the DEPLOYED copy — the exact
+# file Sigma FM's loader.ts will read on next startup.
+# If any sandbox regex matches (even inside a comment), validateExtensionCode()
+# rejects the extension and loader.ts throws BEFORE `new Worker()`: the
+# extension silently never loads — no UI error, no notification, sidecar 0
+# requests. Rules are read LIVE from sandbox.ts, so this gate never goes stale.
+$sandboxScanner  = Join-Path $PSScriptRoot '..\..\scripts\scan-sandbox-dynamic.cjs'
+$sandboxTs       = Join-Path $PSScriptRoot '..\..\sigma-file-manager\src\modules\extensions\runtime\sandbox.ts'
+$deployedIndexJs = Join-Path $appDataDir 'extensions\kizemo.focus-sync\dist\index.js'
+if ((Test-Path $sandboxScanner) -and (Test-Path $deployedIndexJs) -and (Test-Path $sandboxTs)) {
+    Write-Host "==> Validating extension against Sigma FM sandbox (dynamic)"
+    # Pass sandbox.ts explicitly: the scanner's default is CWD-relative, so
+    # relying on it would FATAL (exit 2) on a machine whose CWD is elsewhere.
+    & node $sandboxScanner $deployedIndexJs $sandboxTs
+    if ($LASTEXITCODE -ne 0) {
+        Write-Error @"
+SANDBOX VALIDATION FAILED (exit $LASTEXITCODE).
+Refusing to register an extension Sigma FM will reject. It would load
+SILENTLY-NEVER — no UI error, no notification, sidecar gets 0 requests.
+"@
+        exit 1
+    }
+    Write-Host "==> Extension sandbox validation PASSED"
+} else {
+    # Packaged installs run from $INSTDIR where the repo (and scanner) is absent.
+    Write-Host "==> Sandbox scanner or deployed index.js not found - gate SKIPPED (packaged install)."
+}
+
 # ---- Validation + bootstrap (round 19e, 2026-09-30) ----
 # Earlier this script exited 1 if appDataDir or jsonPath was missing, which
 # silently failed on fresh installs (Sigma FM never launched) and on
