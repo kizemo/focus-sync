@@ -83,6 +83,27 @@ pub struct AppState {
     // 0 = no foreground file dialog.
     pub foreground_dialog_hwnd: AtomicI64,
 
+    // ---- v0.5.8: is the extension actually alive right now?
+    //
+    // The plugin polls `GET /health` every 15s for its own health check. That
+    // poll is an independent liveness signal for Sigma FM's extension worker:
+    // if /health has not been hit recently, the extension is NOT running, and
+    // therefore no fresh path can possibly be arriving.
+    //
+    // WHY THIS EXISTS (observed twice on 2026-10-08):
+    //   Sigma FM started 15:34:11 -> extension activated 15:37:09 (2m58s late)
+    //   Sigma FM started 16:31:41 -> still not active 100s later
+    // During that window the sidecar held the PRE-restart path and injected it
+    // into every new dialog, because nothing marked it as stale. The user saw
+    // "old address gets filled in" and no amount of switching in Sigma FM could
+    // fix it, since the extension that would push a new path was not up yet.
+    //
+    // Note this is strictly better than a time-since-last-PUSH threshold: a
+    // user who navigates once and then works in a dialog for an hour keeps
+    // getting polls, so sync still works. Only a genuinely absent or
+    // not-yet-started extension stops it.
+    pub last_health_poll_ts: AtomicU64,
+
     // ---- v0.5.7 G-2: is a write-back currently executing?
     //
     // The monitor polls every 8ms while tracking a dialog; one UIA+SendInput
@@ -128,6 +149,7 @@ impl AppState {
             unsupported_dialog_count: AtomicU64::new(0),
             first_push_received: AtomicBool::new(false),
             foreground_dialog_hwnd: AtomicI64::new(0),
+            last_health_poll_ts: AtomicU64::new(0),
             sync_in_progress: AtomicBool::new(false),
         }
     }
@@ -232,8 +254,44 @@ impl AppState {
             && self.has_first_push_received()
     }
 
-    pub fn get_current_path(&self) -> String {
-        let guard = self.current_path.lock().unwrap_or_else(|e| e.into_inner());
+    /// v0.5.8 — record that the extension just pinged `/ext_alive`.
+    /// Called from `http_server::handle_ext_alive`; the ONLY writer.
+    ///
+    /// Deliberately NOT stamped by `/health`: that endpoint is shared with
+    /// diagnostic tooling, so a stamp there would mean "someone read a status
+    /// page", not "Sigma FM's extension is running".
+    pub fn mark_extension_ping(&self) {
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        self.last_health_poll_ts.store(ts, Ordering::Relaxed);
+    }
+
+    /// v0.5.8 — raw value of the last extension ping (0 if never seen).
+    pub fn last_extension_ping_ts(&self) -> u64 {
+        self.last_health_poll_ts.load(Ordering::Relaxed)
+    }
+
+    /// v0.5.8 — is a fresh extension ping within `window_ms`?
+    ///
+    /// Returns false when we have NEVER been pinged (0), which is the state a
+    /// freshly started sidecar is in until the extension's first ping lands
+    /// (~15s). That is intentional: a sidecar that has never heard from the
+    /// extension has no path worth injecting.
+    pub fn extension_alive(&self, window_ms: u64) -> bool {
+        let last = self.last_health_poll_ts.load(Ordering::Relaxed);
+        if last == 0 {
+            return false;
+        }
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        now.saturating_sub(last) <= window_ms
+    }
+
+    pub fn get_current_path(&self) -> String {        let guard = self.current_path.lock().unwrap_or_else(|e| e.into_inner());
         guard.clone()
     }
 

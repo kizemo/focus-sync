@@ -80,6 +80,23 @@ use std::process;
 /// non-sidecar process (developer running a test server, etc.) and we
 /// don't want to nuke that.
 fn kill_holding_sidecar() -> bool {
+    // v0.5.8: a unit test must NEVER taskkill the user's real deployment.
+    //
+    // This function is reached from `resolve_port`'s spinner branch whenever a
+    // bind fails. `resolve_port_strict_on_conflict` deliberately occupies a
+    // port to force exactly that path — so before this guard, running
+    // `cargo test` on a developer machine issued
+    //   taskkill /F /IM focus-sync-sidecar.exe /T
+    // against whatever was actually running. Observed 2026-10-08: the test
+    // suite killed the live Scheduled Task sidecar (PID 598276) as a side
+    // effect, which then had to be redeployed by hand.
+    //
+    // Tests must be safe to run against a live install, so the kill is
+    // disabled for them. Production behaviour is unchanged: `cfg!(test)` is
+    // false in every shipped binary, including the one the installer copies.
+    if cfg!(test) {
+        return false;
+    }
     let status = std::process::Command::new("taskkill.exe")
         .args(["/F", "/IM", "focus-sync-sidecar.exe", "/T"])
         .status();
@@ -119,15 +136,27 @@ mod tests {
         assert!(p >= 37422);
     }
 
+    /// v0.5.8: this test asserted `#[should_panic]`, but `resolve_port`
+    /// reports an occupied port by RETURNING `Err` — it never panics. The
+    /// attribute could therefore never be satisfied and the test failed on
+    /// every run, including the ones reported as "66 tests all green".
+    ///
+    /// It also had a live side effect: occupying a port drives the spinner
+    /// branch into `kill_holding_sidecar()`, which taskkilled the real
+    /// deployed sidecar. That is now disabled under `cfg!(test)`, so the
+    /// assertion below checks the real contract — a busy port must be an
+    /// `Err`, never a panic and never a silent fallback to another port.
     #[test]
-    #[should_panic]
     fn resolve_port_strict_on_conflict() {
-        // Bind a port manually, then resolve_port from that port — must error
-        // (spinner mode strict on conflict).
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let occupied = listener.local_addr().unwrap().port();
-        let _ = resolve_port(occupied, false); // should panic (Err)
+        let resolved = resolve_port(occupied, false);
         drop(listener);
+        assert!(
+            resolved.is_err(),
+            "an occupied port must return Err in spinner mode, not panic and not \
+             silently pick another port"
+        );
     }
 
     #[test]

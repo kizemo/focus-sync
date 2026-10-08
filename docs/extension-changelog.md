@@ -15,6 +15,131 @@
 
 ---
 
+## v0.5.8 (2026-10-08)
+
+**BUG-2 根因更正与修复 + 关闭「已知限制」中的 4 项**
+
+本次的起点是一个已被记录的错误结论:`known-issues-2026-10-08.md` 认定 BUG-2 是
+「H2 回退时还原不完整」。**全量日志统计证明写脏文件名框的是 F3 基线路径,不是 H2。**
+详细证据见该文档 BUG-2 小节。一句话版本:F3 把完整路径写进文件名框之后**根本没有还原**,
+而 H2 在故障窗口内一次都没执行过。
+
+### sidecar
+
+| 改动 | 内容 |
+|---|---|
+| **BUG-2** | F3 基线改为:写前快照 → 写 `target_path` → 50ms → **还原原文件名 → 读回证明**。两次机会,仍失败则 `error!` 报出当前脏值 |
+| **H2 假成功** | 新增 `restore_filename_verified()`,H2 的还原从「`SetValue` 返回 Ok」升级为「读回值完全相等」。**还原失败时返回 false**,不再谎报成功 |
+| **死 HWND 累积** | `inject_folder_path` 入口先查 `IsWindow`,是死句柄直接返回新的 `DialogOutcome::DialogGone`;`writer` 随即把它从注册表摘除。**绝不累加 `unsupported_dialog_count`** |
+| **版本号可辨识** | `SPIKE_VERSION` 从 `0.5.5`(自 v0.5.5 起就没再动过,横跨 v0.5.6/v0.5.7)改为 `0.5.8`,`/health` 现在能报出真实运行版本 |
+| **测试副作用** | `kill_holding_sidecar()` 在 `cfg!(test)` 下短路。**修复前每跑一次 `cargo test` 都会 `taskkill /F` 掉你正在运行的 sidecar**(2026-10-08 实测,杀掉了 PID 598276) |
+| **测试断言** | `resolve_port_strict_on_conflict` 原标 `#[should_panic]`,但 `resolve_port` 是返回 `Err` 不是 panic,该断言永远不可能成立 —— 改为断言 `is_err()` |
+
+### 插件(`dist/index.js`)
+
+| 改动 | 内容 |
+|---|---|
+| **P1 推送无 trace** | 见下,这是本次最反直觉的一条 |
+| **P3 `getCurrentPath()` 返回 null** | 新增 `resolveCurrentPath()`:先问 `getCurrentPath()`,拿不到就回落 `lastKnownPath`。工具栏「Sync Now」原本每次都只能弹「No current folder.」 |
+
+---
+
+### P1 的真实机理:证据被观测行为本身冲掉了
+
+复盘记录的现象是「sidecar 收到了 `/set_path`,但 trace 里没有 N05/N06/N07/N08,
+且 seq 连续无缺口」。实测 trace 环(300 条)后发现:
+
+```
+N13.notify.decide      150
+N03.health.resp        150
+推送路径节点            0        ← 一条都没有
+```
+
+**环被健康轮询 100% 占满了。** 健康检查每 15s 产生一对节点,其中 N03 的
+`bodyFp` 每次展开成约 250 个字符的码元数字列表。按这个速率,37 分钟就能把
+300 条的环冲掉三轮 —— 而 `seq` 之所以「连续无缺口」,是因为**每一条都是健康节点**,
+推送节点在落盘前就被挤出去了。
+
+⇒ **不是 trace 丢了,是被覆盖了。** 观测行为本身销毁了待观测的证据。
+
+修复分两半:
+- **止血**:N13 只在计数变化/通知被抑制/建立基线时记录(原本每次轮询都记,且 payload
+  恒为 `increased:false`);N03 健康路径不再记录 `bodyFp`(`bodyType` 已足够证明
+  G-7 的结论,`bodyFp` 只在解析失败时才真正有诊断价值,那仍由 N12 保留)
+- **可判定**:新增 `N18.schedule`(调度入口)与 `N19.push.enter`(`pushNow` 第一行,
+  在 `enabled` 判断之前)。现在「回调没触发 / 定时器没触发 / pushNow 跑了但 trace 丢了」
+  三种情况在日志里长得不一样
+
+---
+
+## v0.5.8 续 —— 同日第二轮(四个新根因)
+
+上一节记的是「计划中的修复」。下面四条是**部署后被用户实测打出来**的,每条都在用户界面上出现过才修。
+
+### 1. 重复写入(地址栏跳两次)
+
+```
+08:00:47.939  [monitor] dialog detected: hwnd=15467576
+08:00:47.959  [monitor] regained foreground, last_written=''  -> resync
+08:00:48.387  write_path commit=true
+08:00:49.286  write_path commit=false          <-- 同一弹窗,同一个目标,900ms 后再写一遍
+```
+
+成因:`last_resync_at` 只在 `should_resync && !should_push` 时才设置,而**弹窗首次检测走的是 `should_push` 分支**,于是没有武装冷却。8ms 后的下一个 tick 发现 `last_written` 还是空(第一次写入要 ~400ms,main 尚未登记),就又满足一次 resync。
+
+**修法**:`last_resync_at` 改为**每次发送事件都设置**。1200ms 冷却本来就存在,只是没在这条路径上生效。
+
+> 这正是 v0.5.7 DEDUP-1 的盲区 —— DEDUP-1 加在 `/set_path`,没加在 monitor 这条路径上。
+
+### 2. 窗口激活过渡导致「操作已派发但没导航」
+
+```
+16:10:34.531  fg=#32770 另存为        <- 弹窗前台
+16:10:35.412  fg=ForegroundStaging    <- Windows 激活过渡的临时窗口
+16:10:35.553  fg=#32770 另存为        <- 弹窗恢复
+08:10:35.412  H1: no focus element resolvable
+08:10:35.511  H1: ABORTING before dispatching any keys (BUG-1 gate)
+08:10:35.621  H2: ... restored+verified  ->  Injection succeeded
+```
+
+Windows 把窗口激活路由经过一个叫 `ForegroundStaging` 的临时窗口。sidecar 恰好在它存在的 ~150ms 内采样:H1 拿不到焦点元素 → 回退键盘 → BUG-1 闸门**正确拦下**(那一刻前台确实不是弹窗)→ 落到 H2。而 **H2 写文件名框再还原从来不是导航**(Claude Rule 58),于是用户什么都没看到,sidecar 却记了 `Injection succeeded`。
+
+**BUG-1 闸门是工作正常的**,问题是它只报失败、不重试,而闸门后面唯一的选择是一个无效的 H2。
+
+**修法**:不放宽闸门,**在闸门上等**。新增 `await_dialog_foreground()`,闸门判定失败时轮询等待弹窗重新成为前台(上限 500ms)。**每个 `SendInput` 批次前仍逐次校验前台**,全程不抢焦点、不发按键,弹窗没回来照样拒绝。5 处闸门全部接入。
+
+> `ForegroundStaging` 这条**只有独立观察进程才看得见**。sidecar 自己的日志只记「dialog not foreground」这个结果,不记「当时前台到底是什么」。拿 sidecar 的日志查 sidecar 是循环论证。
+> 后续实测:该过渡窗口在**普通应用切换**时也会出现(豆包 ↔ 微信 ↔ 任务切换器),不是弹窗特有。
+
+### 3. 存活信号用了共享诊断端点(陈旧路径注入)
+
+sidecar 由计划任务常驻,生命周期长于 Sigma FM,`current_path` 是「最后一次推送」。Sigma FM 关闭、或刚重启而扩展尚未激活时,那个路径就是陈旧的,而 sidecar 仍会注入 —— 用户看到「打开弹窗就被填了旧地址」。
+
+实测扩展激活延迟:**15:34:11 启动 → 15:37:09 激活(2m58s)**;16:31:41 启动 → 100s 后仍未激活。
+
+**修法**:用「扩展是否存活」作为门槛。插件每 15s 轮询一次,sidecar 以此判断该路径是否还值得注入;超窗则**拒绝写入**,返回独立错误码 `extension_not_alive`(不复用 `unsupported_dialog_type`,不累加计数器)。
+
+> **这比「路径超过 N 分钟即过期」好得多**:后者会误伤「导航一次然后专心下载一小时」——只要 Sigma FM 开着,轮询就一直来,同步就一直有效。只有真正关掉、或还没起来的扩展才停止注入。
+
+### 4. 存活信号端点选错 + 观测值在盖章后测量
+
+第 3 条的**第一版实现是错的**,两处:
+
+**(a) 用 `/health` 当存活信号。** 它是**共享诊断端点** —— `read-sidecar-log.ps1`、临时 `Invoke-WebRequest`、每一次调试会话都会调它。证据:静默 75 秒后 `last_health_poll_age_ms=20038`,精确等于观测者自己两次读取的间隔,期间无第三方轮询。**等于拿被污染的信号当生命线。**
+**修法**:新增插件专属端点 `GET /ext_alive`,只有插件会调;`/health` 不再盖章。
+
+**(b) 在盖章之后才测量。**
+```rust
+state.mark_health_poll();                        // 盖章
+let alive_after = state.extension_alive(window); // 紧接着量 → 恒为 true
+```
+于是 `/health` 报出来的 `extension_alive` **永远是 true**,闸门被自己的观测值完全掩盖(实测 `age=99360ms` 却报 `alive=true`,自相矛盾)。
+**修法**:`/health` 只读不写,报真实存储值。
+
+> **教训:一个你看不了的闸门,和一个没接线的闸门在外部完全无法区分。** 本项目历史上每一个静默失效(BUG-2 的注册表、死 HWND 计数器、P1 的 trace 环被挤满)都是这个形状。现在闸门开合都会打日志,并且输入与判定都从 `/health` 可读。
+
+---
+
 ## v0.5.5 (2026-10-06)
 
 **1 行 return false 修复**
@@ -171,11 +296,12 @@ node scripts\scan-sandbox-dynamic.cjs release\extension\dist\index.js
 
 | 项 | 状态 | 证据 / 激活条件 |
 |---|---|---|
-| **H1 只在对话框打开时有效** | **开放,待修复** | 全量日志统计:`H1-OK 48 / H1-FAIL 8`,**无一例外** —— 对话框刚打开(`opened_write_back`)时前台是它,H1 成功并真正导航;用户在 Sigma FM 里切目录(`/set_path`)时前台是 Sigma FM,H1 必然失败并退到 H2。H2 往 filename 控件写路径再还原,**按 Claude Rule 58 那不是导航** => 用户抱怨的是「打开弹窗时对、之后切目录就不动」 |
-| **COM SetFolder 从未成功** | 结构性 | 全部日志 `COM SetFolder succeeded = 0 / unavailable = 107`。用户的对话框一直是 WinUI 3 封装,拿不到经典 IFileDialog。**零代码验证法**:开 `edge://flags/#edge-legacy-file-picker` 后重测,若立刻出现 succeeded,则 H1/H2/F3 回退链可退休 |
-| **缺陷 B:告警通道整体失效** | **开放** | `JSON.parse(/health body)` 失败 => `checkHealth()` 的 `unsupported_dialog_count` 整块被跳过 =>「对话框不受支持」提示**永不触发**。已加 `N12/N13/N14` 节点,重启后 15 秒内可得响应体指纹 |
-| **缺陷 A:对死 HWND 写入** | **开放** | 对话框关闭后注册表仍保留条目,写入返回 `0x80040201` 并被误标为 `unsupported_dialog_type`,污染 `unsupported_dialog_count` |
-| **`/health` 响应缺 `charset`** | **开放** | `Content-Type: application/json` 未带 `charset=utf-8`,任何非 UTF-8 默认代码页的客户端都会看到乱码。**2026-10-07 曾因此导致一次假根因调查** |
+| **H1 只在对话框打开时有效** | **开放,待修复** | 全量日志统计:`H1-OK 48 / H1-FAIL 8`,**无一例外** —— 对话框刚打开(`opened_write_back`)时前台是它,H1 成功并真正导航;用户在 Sigma FM 里切目录(`/set_path`)时前台是 Sigma FM,H1 必然失败并退到 H2。H2 往 filename 控件写路径再还原,**按 Claude Rule 58 那不是导航** => 用户抱怨的是「打开弹窗时对、之后切目录就不动」。⚠️ **2026-10-08 更新**:DIRECT-1(直接 UIA SetValue 替换地址栏)改变了这个格局 —— `H1 succeeded` 全历史 86 次,其中 DIRECT 路径 5 次、键盘回退 81 次,**两者不等价**,DIRECT-1 成功时不需要前台地址栏焦点以外的额外条件。修订结论需要一次新的定向实验,不要沿用旧的 48/8 数字 |
+| **COM SetFolder 从未成功** | 结构性 | 全部日志 `COM SetFolder succeeded = 0`(累计 unavailable 107+ 次,零代码验证法:开 `edge://flags/#edge-legacy-file-picker` 后重测,若立刻出现 succeeded,则 H1/H2/F3 回退链可退休) |
+| **缺陷 B:告警通道整体失效** | ✅ 已修复 | `JSON.parse(/health body)` 失败 => `checkHealth()` 的 `unsupported_dialog_count` 整块被跳过。**G-7 已修**(`decodeHttpBody` 用 `ArrayBuffer.isView`,`instanceof` 跨 realm 不成立)。实测 2026-10-08:`N13.notify.decide` 正常记录,告警通道活着 |
+| **缺陷 A:对死 HWND 写入** | ✅ 已修复(v0.5.8,**两轮才真正生效**) | 第一版把 `IsWindow` 检查放在 `inject_folder_path` 入口,返回独立错误码 `dialog_gone` 并就地摘除注册表 —— 但 `http_server` 的两个 `continue`(DEDUP 跳过、R-2 非前台延后)都发生在它之前,死句柄永远到不了检查处,实测 `active_dialogs` 仍涨到 3 而实际存活弹窗为 0。**第二版把清理移到 `handle_set_path` 循环体的最前面**,早于两个 `continue`,才真正生效(`http_server.rs:298` prune,先于 L316 / L356) |
+| **`/health` 响应缺 `charset`** | ✅ 已修复(v0.5.8) | `Content-Type` 现为 `application/json; charset=utf-8`。sidecar 一直发的是 UTF-8,只是没说;客户端(如 PowerShell 5.1 的 `Invoke-WebRequest .Content`)会退回系统 ANSI 代码页 936,把 `E:\办公文件` 显示成 `E:\åŠå…æä»¶`。**2026-10-08 一天内因此浪费三次排查**,其中一次差点被当成编码 bug 去查一个不存在的乱码问题(`Invoke-RestMethod` 恰好解码正确、`Invoke-WebRequest` 不正确,这种分裂最误导) |
+| **H1 键盘回退路径把路径重复输入两遍** | **开放,休眠中** | `uia_inject.rs` 的 `try_send_path_via_sendinput` 里有**两段完全相同**的「End + 128×Backspace + 逐字输入」代码块(L647-655 与 L678-686,前者是原有实现,后者是 G-5 补丁追加的,其注释描述的行为前者已实现)。净地址栏内容不变,但单次注入的事件数翻倍,并把「清空再输入」的可见时间窗拉长一倍。⚠️ **2026-10-08 17:06 复核:缺陷仍在源码中,但已被绕过 —— 激活等待修复之后(08:47Z 起)的 5 次 H1 尝试全部走 DIRECT-1,键盘回退 0 次;修复前今日 40 次尝试中键盘回退占 17 次。所以不是「已解决」,是「暂时走不到」:一旦 DIRECT-1 失败(对话框无可聚焦地址栏等),重复输入立即回来。** 用户 2026-10-08 决定本轮不改动(避免动已确认达标的 H1) |
 | `__binaries["focus-sync-sidecar"].path = null` | 休眠 —— 部署源码中 `sigma.binary` 零匹配 | 任何转向「extension 启动 sidecar」的架构变更 |
 | `build_http_client()` 无 `.no_proxy()` | 休眠 —— 当前 `ProxyEnable=0` | 用户开启系统代理(已配置 `127.0.0.1:7897`) |
 | P2-1 HTTP -> stdio(省 ~340 行) | 暂缓 | 功能恢复验证通过后再议 |

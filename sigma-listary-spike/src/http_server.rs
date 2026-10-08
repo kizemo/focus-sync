@@ -33,7 +33,17 @@ use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
 // v0.5.5: 41477 exclusion + first_push_received flag + /health expose +
 // should_opened_write_back helper. See:
 // docs/superpowers/plans/2026-10-06-focus-21-v0.5.5-ship-ready-plan-v6.md
-const SPIKE_VERSION: &str = "0.5.5";
+//
+// v0.5.8 (2026-10-08): bumped so the running build is IDENTIFIABLE from
+// /health. It had been stuck at "0.5.5" through v0.5.6, v0.5.7 and the
+// v0.5.7-verified rollback node, so a live sidecar could not be told apart from
+// any other live sidecar by anything it reported. That ambiguity has been
+// assumed away more than once in this project's history; a one-line version
+// that is actually maintained is the cheapest fix available.
+//
+// v0.5.8 carries: F3 filename-box restore + read-back (BUG-2), H2 read-back
+// verification (the "假成功" limitation), and the `dialog_gone` dead-HWND path.
+const SPIKE_VERSION: &str = "0.5.8";
 
 #[derive(Debug, Deserialize)]
 struct SetPathBody {
@@ -87,6 +97,20 @@ struct HealthResponse {
     /// Extension reads this to detect "sidecar is waiting for PUSH" and
     /// show user a "Sync Now?" notification.
     first_push_received: bool,
+    /// v0.5.8: Unix millis of the LAST `GET /health` from the extension (0 if
+    /// never).
+    ///
+    /// Exposed because the stale-path gate depends on it and the gate
+    /// previously had NO observable output: when writes were being refused (or
+    /// wrongly allowed) there was nothing to look at except "a Write happened"
+    /// or "a Write did not happen". A gate you cannot read is indistinguishable
+    /// from a gate that is not wired up. This value makes the gate's input
+    /// visible from outside the process.
+    last_health_poll_ts: u64,
+    /// v0.5.8: ms since that poll, or -1 if the extension has never polled.
+    last_health_poll_age_ms: i64,
+    /// v0.5.8: the gate's verdict. Writes are refused unless this is true.
+    extension_alive: bool,
 }
 
 /// Blocking HTTP server loop. Returns when the server is dropped (e.g. after
@@ -126,6 +150,23 @@ pub fn run_server(state: Arc<AppState>, port: u16, mode: &'static str) -> Result
             (Method::Get, "/health") => {
                 if let Err(e) = handle_health(request, state, mode) {
                     tracing::warn!(error = %e, "health handler error");
+                }
+            }
+            // v0.5.8: extension liveness ping.
+            //
+            // DELIBERATELY NOT `/health`. `/health` is a shared diagnostic
+            // endpoint: `scripts\read-sidecar-log.ps1`, ad-hoc
+            // `Invoke-WebRequest` and every debugging session hit it. Stamping
+            // liveness there meant a single diagnostic read kept the
+            // stale-path gate open — proven 2026-10-08 by watching
+            // `last_health_poll_age_ms` track the observer's own polling.
+            //
+            // This endpoint is called ONLY by the extension's periodic health
+            // check, so a stamp here genuinely means "Sigma FM's extension is
+            // alive", which is what the gate actually needs to know.
+            (Method::Get, "/ext_alive") => {
+                if let Err(e) = handle_ext_alive(request, state) {
+                    tracing::warn!(error = %e, "ext_alive handler error");
                 }
             }
             _ => {
@@ -238,6 +279,28 @@ fn handle_set_path(
         ts: now_iso8601(),
     });
     for d in dialogs {
+        // v0.5.8 dead-HWND pruning — THIS is the gap that made the earlier
+        // `dialog_gone` fix ineffective.
+        //
+        // The registry deliberately keeps dialogs after `DialogEvent::Closed`
+        // (round 19c) so a foreground flicker cannot lose the write target.
+        // The cost is that destroyed windows stay forever. My first attempt
+        // put the liveness check inside `inject_folder_path`, but the two
+        // `continue` statements BELOW (DEDUP skip, R-2 "not foreground" defer)
+        // both fire first, so a dead handle never reached it: `active_dialogs`
+        // was observed climbing to 3 while zero dialogs were open.
+        //
+        // Pruning has to happen BEFORE those skips, which is why it lives here
+        // rather than deeper in the injection path.
+        if !crate::uia_inject::dialog_window_exists(d.hwnd) {
+            state.remove_dialog(d.hwnd);
+            tracing::info!(
+                "v0.5.8 set_path: pruning dead dialog hwnd={} (app={}) from registry",
+                d.hwnd,
+                d.app
+            );
+            continue;
+        }
         // v0.5.7 DEDUP-1: skip a dialog that already holds this EXACT path.
         //
         // Observed 2026-10-08 14:02: the Opened write-back injected once, then
@@ -388,6 +451,24 @@ fn handle_health(
     mode: &'static str,
 ) -> Result<()> {
     let snap = state.health_snapshot();
+    let window = crate::writer::EXTENSION_ALIVE_WINDOW_MS;
+
+    // v0.5.8: READ the gate's state, never stamp it. Stamping moved to
+    // /ext_alive precisely because this endpoint is shared with diagnostics.
+    // Reading it here (rather than after a stamp) is what makes the reported
+    // value trustworthy — measuring immediately after writing made it
+    // constant true, which hid the gate entirely.
+    let last_poll = state.last_extension_ping_ts();
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let age_ms: i64 = if last_poll == 0 {
+        -1
+    } else {
+        now_ms as i64 - last_poll as i64
+    };
+    let alive_now = state.extension_alive(window);
     let status = if snap.uia_healthy && snap.session_id != 0 {
         "ok"
     } else {
@@ -406,8 +487,36 @@ fn handle_health(
         unsupported_dialog_count: snap.unsupported_dialog_count,
         // v0.5.5 (Mavis Round 21 B-4)
         first_push_received: snap.first_push_received,
+        // v0.5.8: the stale-path gate's input and verdict, both visible.
+        last_health_poll_ts: last_poll,
+        last_health_poll_age_ms: age_ms,
+        extension_alive: alive_now,
     };
     respond_json(request, 200, &ResponseBody::Health(body))
+}
+
+/// v0.5.8 — extension liveness ping. Stamps the ONLY stamp the stale-path gate
+/// reads. See the route comment in `run_server` for why this cannot be
+/// `/health`.
+fn handle_ext_alive(
+    request: tiny_http::Request,
+    state: Arc<AppState>,
+) -> Result<()> {
+    let window = crate::writer::EXTENSION_ALIVE_WINDOW_MS;
+    let alive_before = state.extension_alive(window);
+    state.mark_extension_ping();
+    let alive_after = state.extension_alive(window);
+
+    // Announce the transition out loud, once, in both directions. Every silent
+    // gate in this project's history became a bug nobody could see.
+    if !alive_before && alive_after {
+        tracing::info!(
+            "v0.5.8 EXTENSION ALIVE: /ext_alive ping received; stale-path gate OPEN"
+        );
+    }
+
+    let resp = ResponseBody::Ok { ok: true, error: None };
+    respond_json(request, 200, &resp)
 }
 
 // ---- response helper ----
@@ -418,9 +527,21 @@ fn respond_json(
     body: &ResponseBody,
 ) -> Result<()> {
     let json = serde_json::to_string(body)?;
+    // v0.5.8: charset=utf-8 — this endpoint has always sent bare
+    // `application/json`, and the omission has cost real time three times on
+    // 2026-10-08 alone: `Invoke-WebRequest ... .Content` returned
+    // `E:\åŠå…æä»¶` for `E:\办公文件`, because the client falls back to the
+    // system ANSI code page (936/GBK on this machine) when no charset is
+    // declared. The sidecar sends UTF-8 unconditionally, so declaring it is
+    // simply making the truth visible. Note that `Invoke-RestMethod` happened
+    // to decode correctly while `Invoke-WebRequest` did not — the kind of
+    // split that sends you hunting a mojibake bug that does not exist.
     let response = Response::from_string(json)
         .with_status_code(StatusCode(status))
-        .with_header(Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap());
+        .with_header(
+            Header::from_bytes(&b"Content-Type"[..], &b"application/json; charset=utf-8"[..])
+                .unwrap(),
+        );
     request.respond(response)?;
     Ok(())
 }
@@ -455,6 +576,9 @@ mod tests {
             unsupported_dialog_count: snap.unsupported_dialog_count,
             // v0.5.5 (Mavis Round 21 B-4)
             first_push_received: snap.first_push_received,
+            last_health_poll_ts: 0,
+            last_health_poll_age_ms: -1,
+            extension_alive: false,
         };
         let json = serde_json::to_string(&resp).unwrap();
         assert!(json.contains("\"status\":\"ok\""));
@@ -486,6 +610,9 @@ mod tests {
             unsupported_dialog_count: 0,
             // v0.5.5 (Mavis Round 21 B-4)
             first_push_received: false,
+            last_health_poll_ts: 0,
+            last_health_poll_age_ms: -1,
+            extension_alive: false,
         };
         let json = serde_json::to_string(&body).unwrap();
         assert!(json.contains("\"status\":\"degraded\""));
@@ -509,6 +636,9 @@ mod tests {
             unsupported_dialog_count: 7,
             // v0.5.5 (Mavis Round 21 B-4)
             first_push_received: false,
+            last_health_poll_ts: 0,
+            last_health_poll_age_ms: -1,
+            extension_alive: false,
         };
         let json = serde_json::to_string(&body).unwrap();
         assert!(

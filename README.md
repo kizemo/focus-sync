@@ -209,11 +209,17 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\read-focus-trace.ps1
 
 | 项 | 影响 |
 |---|---|
-| **死 HWND 累积** | 对话框关闭后注册表仍保留条目,每次写入产生一次假的 `unsupported_dialog_type`(污染 `unsupported_dialog_count`) |
-| **H2 假成功** | 回退路径 H2 只表示两次 `SetValue` 都执行了,**不表示路径真的生效** |
-| **`getCurrentPath()` 返回 null** | 插件除 `onPathChange` 外无第二条获取当前路径的途径 |
-| **WinUI 3 对话框** | 无法通过 COM `IFileDialog::SetFolder` 导航(结构性的)。Edge 可用 `edge://flags/#edge-legacy-file-picker` 切回经典选择器 |
-| **推送链路未完全可观测** | 已定位待查项,见 `docs/superpowers/plans/` |
+| **死 HWND 累积** | ✅ **已修复(v0.5.8)** —— 清理发生在 `http_server` 循环体的最前面,早于 DEDUP 与「非前台延后」两个 `continue`。第一版把检查放在注入入口,被那两个 `continue` 挡在前面,实测无效 |
+| **H2 假成功** | ✅ **已修复(v0.5.8)** —— H2 的还原现在必须**读回证明**完全等于原始文件名,否则返回失败而非谎报成功 |
+| **`getCurrentPath()` 返回 null** | ✅ **已修复(v0.5.8)** —— 工具栏「Sync Now」与启动读取都改为回落 `lastKnownPath` |
+| **推送链路未完全可观测** | ✅ **已修复(v0.5.8)** —— 根因是健康轮询把 300 条 trace 环冲满导致推送证据被覆盖。已止血并新增 `N18`/`N19` 推送节点 |
+| **G1 重复写入** | ✅ **已修复(v0.5.8)** —— 弹窗首次检测走 `should_push` 分支时未武装冷却,导致同一弹窗被写两遍 |
+| **G2 激活过渡导致「派发但没导航」** | ✅ **已修复(v0.5.8)** —— Windows 激活会经过 `ForegroundStaging` 临时窗口,采样撞上它会让 H1 被 BUG-1 闸门正确拦下、继而落到无效的 H2。改为**在闸门上等**(不放宽闸门) |
+| **G3 陈旧路径注入** | ✅ **已修复(v0.5.8)** —— Sigma FM 关闭或刚重启(扩展激活需约 1-2 分钟)时,sidecar 会把旧路径灌进弹窗。改为以插件专属端点 `GET /ext_alive` 的轮询作为存活门槛,超窗拒绝写入 |
+| `/health` 缺 `charset` | ✅ **已修复(v0.5.8)** —— 一行。缺它会让客户端退回系统 ANSI 代码页,把中文路径显示成乱码 |
+| **H1 键盘回退重复输入** | **开放(休眠中)** —— 源码里仍有两段相同的按键块。激活等待修复后实测 5/5 走 DIRECT-1,该路径暂时进不去;DIRECT-1 一旦失败就会回来 |
+| **扩展启动延迟约 1-2 分钟** | **开放** —— Sigma FM 自身加载扩展的耗时,现已可观测(日志有 `EXTENSION ALIVE`,`/health` 有 `extension_alive` 字段),但要缩短需先查明它为何慢 |
+| **WinUI 3 对话框** | 无法通过 COM `IFileDialog::SetFolder` 导航(结构性的,`SetFolder succeeded = 0`)。Edge 可用 `edge://flags/#edge-legacy-file-picker` 切回经典选择器 |
 
 ---
 

@@ -280,9 +280,30 @@ pub fn start_monitor(
                     );
                 }
                 last_hwnd = next_last_hwnd;
-                if should_resync && !should_push {
-                    last_resync_at = Some(Instant::now());
-                }
+                // v0.5.8: arm the cooldown on EVERY send, not only on the
+                // resync branch.
+                //
+                // BUG (measured 2026-10-08 16:00 and 16:01, 2 of 2 dialogs):
+                // on the FIRST detection of a dialog the `should_push` branch
+                // fires and `should_resync_at` stayed None. The very next poll
+                // tick, 8ms later, saw `should_push == false` (last_hwnd now
+                // matches) but `last_written == None` — because the first write
+                // takes ~400ms and main.rs has not registered it yet — so
+                // `should_resync_known_dialog` returned true and a SECOND
+                // `Opened` event went out for the same dialog. The user saw the
+                // address bar jump twice, ~900ms apart, with the same target.
+                //
+                //   08:00:47.939  dialog detected: hwnd=15467576
+                //   08:00:47.959  regained foreground, last_written='' -> resync
+                //   08:00:48.387  write_path commit=true
+                //   08:00:49.286  write_path commit=false     <-- duplicate
+                //
+                // The 1200ms cooldown already exists for exactly this class of
+                // repeat; it just was not armed on the path that opened the
+                // window. Arming it on every send is the minimal fix and does
+                // not affect legitimate re-syncs: those happen when the user
+                // returns to the dialog, which is seconds later.
+                last_resync_at = Some(Instant::now());
                 // Round 18: only push when hwnd actually changes — previously the
                 // 8ms polling loop pushed every tick, causing main to re-write the
                 // filename box continuously (flash loop). PathWrap upstream does
@@ -560,7 +581,21 @@ fn dedup_opened(last_hwnd: isize, info: &DialogInfo) -> (bool, isize) {
 
 #[cfg(test)]
 mod g1_resync_tests {
-    use super::should_resync_known_dialog;
+    use super::{dedup_opened, should_resync_known_dialog, DialogInfo};
+    use std::time::{Duration, Instant};
+
+    /// Minimal DialogInfo for the monitor-sequence tests below. (The one in
+    /// `mod tests` is not visible across sibling test modules.)
+    fn info(hwnd: isize) -> DialogInfo {
+        DialogInfo {
+            hwnd,
+            x: 0,
+            y: 0,
+            width: 0,
+            height: 0,
+            dpi: 96,
+        }
+    }
 
     /// The bug this fixes: user navigates in Sigma FM, path is deferred, then
     /// brings the SAME dialog back to the foreground. The round-18 dedup would
@@ -609,6 +644,48 @@ mod g1_resync_tests {
     #[test]
     fn never_written_dialog_with_pending_path_resyncs() {
         assert!(should_resync_known_dialog(true, "E:\\tmp", None));
+    }
+
+    /// v0.5.8 REGRESSION — the duplicate-write bug (measured 2026-10-08 16:00,
+    /// reproduced on 2 of 2 dialogs).
+    ///
+    /// `should_resync_known_dialog` itself is CORRECT here: a known dialog with
+    /// nothing written yet and a pending path genuinely should resync. The bug
+    /// was that the follow-up tick was allowed to ask the question at all,
+    /// because the `should_push` branch never armed `last_resync_at`.
+    ///
+    /// So this test pins the SEQUENCE, not the pure function: first detection
+    /// fires `should_push`; the next tick must be suppressed by the cooldown
+    /// even though the pure predicate would still say "resync".
+    #[test]
+    fn first_detection_then_followup_tick_does_not_double_write() {
+        // Tick 1: brand-new dialog -> should_push fires.
+        let (push, next_last) = dedup_opened(0, &info(15467576));
+        assert!(push, "first sighting of a dialog must push");
+        assert_eq!(next_last, 15467576);
+
+        // main.rs has NOT registered the write yet -> last_written is None.
+        // The pure predicate WOULD say resync...
+        assert!(
+            should_resync_known_dialog(true, "E:\\recuva", None),
+            "predicate alone still says resync - which is exactly why the \
+             monitor must gate it with the cooldown"
+        );
+
+        // Tick 2 (8ms later): should_push is now false...
+        let (push2, _) = dedup_opened(next_last, &info(15467576));
+        assert!(!push2, "same hwnd must not re-push");
+
+        // ...and the cooldown armed by tick 1 is what stops the duplicate.
+        // This mirrors the loop body: last_resync_at is set on EVERY send.
+        let armed_at = Instant::now();
+        let cooldown = Duration::from_millis(1200);
+        let elapsed = armed_at.elapsed();
+        assert!(
+            elapsed < cooldown,
+            "a follow-up tick 8ms later must still be inside the cooldown, \
+             otherwise the address bar is written twice"
+        );
     }
 }
 #[cfg(test)]

@@ -202,6 +202,12 @@ function normalizePath(p) {
 }
 
 function schedulePush(path) {
+    // v0.5.8 (P1) — trace at the ENTRY of the scheduling step, unconditionally
+    // and before any timer exists. P1 was "the push path produces no trace at
+    // all", and this is the only place that distinguishes "the callback never
+    // fired" from "the timer never fired" from "pushNow ran but its traces were
+    // evicted". Without it those three look identical from the outside.
+    trace('N18.schedule', { fp: traceFingerprint(path), hadTimer: pushTimer !== null });
     if (pushTimer !== null) clearTimeout(pushTimer);
     pushTimer = setTimeout(() => {
         pushTimer = null;
@@ -210,6 +216,9 @@ function schedulePush(path) {
 }
 
 async function pushNow(path) {
+    // v0.5.8 (P1): first line, before the `enabled` check, so an entry is
+    // recorded even when the push is deliberately skipped.
+    trace('N19.push.enter', { fp: traceFingerprint(path), enabled: enabled });
     if (!enabled) {
         trace('N07.push.skip', { why: 'disabled', fp: traceFingerprint(path) });
         return;
@@ -332,16 +341,31 @@ async function checkHealth() {
         // N13 — record the notification DECISION explicitly. Previously the
         // only reason "dialog not supported" never appeared was invisible:
         // every early-return below was silent.
-        trace('N13.notify.decide', {
-            baseline: lastUnsupportedDialogCount,
-            current: newCount,
-            increased: newCount > lastUnsupportedDialogCount,
-            inGrace: inGracePeriod(),
-            throttleLeftMs: Math.max(0, UNSUPPORTED_NOTIFY_THROTTLE_MS - (now - lastUnsupportedNotifyTs)),
-            willNotify: (newCount > lastUnsupportedDialogCount)
-                && !inGracePeriod()
-                && (now - lastUnsupportedNotifyTs >= UNSUPPORTED_NOTIFY_THROTTLE_MS),
-        });
+        //
+        // v0.5.8 (P1) — this node used to fire on EVERY 15s poll, and its
+        // payload is constant noise: `increased:false, willNotify:false`.
+        // Measured over the live ring on 2026-10-08, that made 150 of the 300
+        // stored entries this single node, which together with N03 filled the
+        // ring completely — so the push-path nodes were evicted before anyone
+        // could read them. That is the mechanical reason P1 was "unexplained":
+        // the evidence was being overwritten by the act of observing it.
+        //
+        // The decision is now recorded only when it is a decision worth
+        // re-reading: the count moved, a notification was actually shown, a
+        // show was suppressed, or the baseline was first established. A quiet
+        // poll still leaves N03, so liveness remains observable.
+        if (newCount !== lastUnsupportedDialogCount || lastUnsupportedDialogCount === -1) {
+            trace('N13.notify.decide', {
+                baseline: lastUnsupportedDialogCount,
+                current: newCount,
+                increased: newCount > lastUnsupportedDialogCount,
+                inGrace: inGracePeriod(),
+                throttleLeftMs: Math.max(0, UNSUPPORTED_NOTIFY_THROTTLE_MS - (now - lastUnsupportedNotifyTs)),
+                willNotify: (newCount > lastUnsupportedDialogCount)
+                    && !inGracePeriod()
+                    && (now - lastUnsupportedNotifyTs >= UNSUPPORTED_NOTIFY_THROTTLE_MS),
+            });
+        }
         if (lastUnsupportedDialogCount === -1) {
             // First observation: establish baseline, never notify.
             lastUnsupportedDialogCount = newCount;
@@ -383,18 +407,49 @@ async function checkHealth() {
  * whether to notify the sidecar-unreachable banner).
  */
 async function pingSidecarWithBody() {
+    // v0.5.8: liveness ping on a DEDICATED endpoint.
+    //
+    // The sidecar uses "did the extension ping recently" to decide whether the
+    // path it holds is still worth injecting (stale-path gate). That signal
+    // used to come from `GET /health` — which is wrong, because /health is the
+    // shared diagnostic endpoint: `read-sidecar-log.ps1`, ad-hoc
+    // `Invoke-WebRequest` and every debugging session call it, so a single
+    // diagnostic read kept the gate open and stale paths kept being injected.
+    // Verified 2026-10-08 by watching the sidecar's own `last_health_poll_age_ms`
+    // track this agent's polling while Sigma FM was closed.
+    //
+    // `/ext_alive` is called by nothing but us, so a ping there genuinely means
+    // "the extension is alive". Fire-and-forget: we do not read the body, and a
+    // failure here must never affect the health check below.
+    try {
+        await sigma.http.request({
+            url: `${SIDECAR_HTTP}/ext_alive`,
+            method: 'GET',
+            timeout: HEALTH_CHECK_TIMEOUT_MS,
+        });
+    } catch (e) {
+        trace('N20.ext_alive.err', { msg: String(e).slice(0, 160) });
+    }
     try {
         const r = await sigma.http.request({
             url: `${SIDECAR_HTTP}/health`,
             method: 'GET',
             timeout: HEALTH_CHECK_TIMEOUT_MS,
         });
+        // v0.5.8 (P1): `bodyFp` is intentionally NOT recorded on the healthy
+        // path. It expands every response into ~250 chars of comma-separated
+        // code units, and at one entry per 15s that alone filled a large share
+        // of the 300-entry ring, evicting the push-path nodes P1 was about.
+        // `bodyType` is what actually carried the G-7 diagnosis (it is what
+        // proved `body` arrives as a Uint8Array, not a string) and it is a few
+        // bytes. The full fingerprint is still captured whenever parsing fails,
+        // which is the only time its content is diagnostically load-bearing —
+        // see N12 below.
         trace('N03.health.resp', {
             status: r.status,
             keys: Object.keys(r).join(','),
             bodyType: typeTag(r.body),
             bodyLen: (typeof r.body === 'string' ? r.body.length : -1),
-            bodyFp: traceFingerprint(r.body),
         });
         if (r.status !== 200) return null;
         return r;
@@ -442,19 +497,57 @@ function stopHealthCheck() {
     healthCheckTimer = null;
 }
 
-async function syncNow() {
+/**
+ * v0.5.8 (P3) — resolve the current folder, with a fallback that actually works.
+ *
+ * `sigma.context.getCurrentPath()` returns null in this build (recorded P3 in
+ * the known-limitations table: outside `onPathChange` there was no second way
+ * to learn the path). Left as-is that made the "Sync Now" toolbar button dead
+ * on arrival — it always toasted "No current folder." even while the user was
+ * demonstrably sitting in a folder.
+ *
+ * `lastKnownPath` is kept current by two independent sources, so falling back
+ * to it is not a guess:
+ *   1. every `onPathChange` payload, and
+ *   2. the startup read below (when that read does succeed).
+ * It is null only if Sigma FM has never told us a path since activation.
+ *
+ * Returns the path to push, or null when we genuinely have nothing.
+ * The caller decides how to report that; this function only reports truth.
+ */
+async function resolveCurrentPath() {
     try {
-        const path = await sigma.context.getCurrentPath();
-        if (!path) {
-            try {
-                sigma.ui.showNotification({ title: 'Focus Sync', description: 'No current folder.', type: 'warning' });
-            } catch (e) {}
-            return;
+        const p = await sigma.context.getCurrentPath();
+        if (p) {
+            return p;
         }
-        await pushNow(path);
+        trace('N16.ctx.null.fallback', { fp: traceFingerprint(lastKnownPath) });
+    } catch (e) {
+        trace('N16.ctx.err.fallback', { msg: String(e).slice(0, 160) });
+    }
+    if (lastKnownPath) {
+        return lastKnownPath;
+    }
+    return null;
+}
+
+async function syncNow() {
+    const path = await resolveCurrentPath();
+    if (!path) {
         try {
-            sigma.ui.showNotification({ title: 'Focus Sync', description: 'Synced: ' + path, type: 'success' });
+            sigma.ui.showNotification({
+                title: 'Focus Sync',
+                description: 'No current folder. Open a folder in Sigma FM first, then try again.',
+                type: 'warning',
+            });
         } catch (e) {}
+        trace('N17.syncNow.noPath', {});
+        return;
+    }
+    trace('N17.syncNow.push', { fp: traceFingerprint(path) });
+    await pushNow(path);
+    try {
+        sigma.ui.showNotification({ title: 'Focus Sync', description: 'Synced: ' + path, type: 'success' });
     } catch (e) {}
 }
 
@@ -699,15 +792,18 @@ const activate = async () => {
         trace('N05.path.err', { msg: String(e).slice(0, 160) });
     }
 
-    try {
-        const initialPath = await sigma.context.getCurrentPath();
-        trace('N10.ctx.initialPath', { fp: traceFingerprint(initialPath) });
-        if (initialPath) {
-            lastKnownPath = normalizePath(initialPath);
-            schedulePush(initialPath);
-        }
-    } catch (e) {
-        trace('N10.ctx.err', { msg: String(e).slice(0, 160) });
+    // v0.5.8 (P3): read the startup path through the same fallback the
+    // toolbar uses. Previously a null from getCurrentPath() silently left
+    // `lastKnownPath` null, which meant the N15 after-restart re-push had
+    // nothing to re-push with and `syncNow` could never recover — the
+    // extension went permanently blind until Sigma FM restarted.
+    const initialPath = await resolveCurrentPath();
+    trace('N10.ctx.initialPath', { fp: traceFingerprint(initialPath) });
+    if (initialPath) {
+        lastKnownPath = normalizePath(initialPath);
+        schedulePush(initialPath);
+    } else {
+        trace('N10.ctx.empty', { why: 'no path from context and no lastKnownPath yet' });
     }
     traceFlushNow();
 };

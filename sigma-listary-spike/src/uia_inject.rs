@@ -102,6 +102,19 @@ use windows::core::GUID;
 
 const VK_RETURN: usize = 0x0D;
 
+/// v0.5.8 — how long to wait out a Windows foreground ACTIVATION TRANSITION
+/// before declaring the dialog unreachable.
+///
+/// The transient `ForegroundStaging` window measured at ~150ms on 2026-10-08,
+/// so 500ms gives generous headroom while keeping the worst-case added latency
+/// well under the ~1.2s resync cooldown — a retry here must finish before the
+/// monitor is allowed to fire again, or the two would fight.
+const ACTIVATION_WAIT_MS: u64 = 500;
+
+/// How many times DIRECT-1 re-queries the focused element while waiting out a
+/// transition. With a 30ms pause between attempts this spans ~150ms of retry.
+const ACTIVATION_ATTEMPTS: usize = 6;
+
 // v0.5.1 (Mavis 第 13 轮 D1 [HIGH]): AllowSetForegroundWindow ASFW_ANY = 0xFFFFFFFF.
 // Per MSDN: dwProcessId = ASFW_ANY means any process is allowed.
 // Windows crate API does not export the symbol `ASFW_ANY`, so we hard-define it
@@ -123,6 +136,12 @@ pub enum DialogOutcome {
     Unsupported,
     /// Zero hwnd or empty target.
     Invalid,
+    /// v0.5.8: the dialog window no longer exists (destroyed, or its handle
+    /// already recycled). This is NOT "unsupported dialog type" and must
+    /// never bump `unsupported_dialog_count` — doing so used to fabricate an
+    /// "unsupported dialog" for every dead handle the registry retained, which
+    /// is what polluted the count the extension notifies on.
+    DialogGone,
 }
 
 // IIDs for COM interop (round 19f, preserved from v0.3.0).
@@ -297,7 +316,18 @@ fn path_landed_in_filename_box(before: Option<&str>, after: Option<&str>) -> boo
     }
 }
 
-/// v0.5.7 BUG-1 — is the target dialog STILL the foreground window *right now*?
+/// v0.5.8 — is this handle still a live window?
+///
+/// Public so `http_server` can prune the registry before its own skip
+/// conditions get a chance to `continue` past a dead entry.
+pub fn dialog_window_exists(dialog_hwnd: u32) -> bool {
+    if dialog_hwnd == 0 {
+        return false;
+    }
+    unsafe { IsWindow(Some(HWND(dialog_hwnd as *mut core::ffi::c_void))).as_bool() }
+}
+
+/// v0.5.7 F-0 — is the target dialog STILL the foreground window *right now*?
 ///
 /// Must be called IMMEDIATELY before every `SendInput` batch, never once at the
 /// top of the injection.
@@ -345,6 +375,52 @@ fn dialog_still_foreground(state: &crate::state::AppState, dialog_hwnd: u32) -> 
     state.foreground_dialog() == dialog_hwnd
 }
 
+/// v0.5.8 — wait out a foreground ACTIVATION TRANSITION instead of giving up.
+///
+/// WHY (measured 2026-10-08 16:10, caught by an independent observer process,
+/// not by the sidecar's own logs): bringing the Save As dialog back to the
+/// foreground makes Windows route the activation through a transient
+/// `ForegroundStaging` window. The monitor caught the dialog, but by the time
+/// the ~450ms UIA scan in main.rs finished, the foreground window was
+/// `ForegroundStaging`:
+///
+///   16:10:34.531  fg=#32770 另存为        <- dialog
+///   16:10:35.412  fg=ForegroundStaging    <- transient, ~150ms
+///   16:10:35.553  fg=#32770 另存为        <- dialog again
+///   08:10:35.412  H1: no focus element resolvable
+///   08:10:35.511  H1: ABORTING before dispatching any keys (BUG-1 gate)
+///
+/// The BUG-1 gate did its job perfectly — the dialog genuinely was not
+/// foreground at that instant, so sending keys would have been unsafe. But the
+/// only thing after the gate is H2, which writes the path into the FILENAME box
+/// and restores it. That is not navigation (Claude Rule 58), so the user saw
+/// no change at all while the sidecar logged `Injection succeeded`.
+///
+/// So we do not relax the gate — we WAIT at it. `dialog_still_foreground` is
+/// still evaluated immediately before every single `SendInput` batch; this only
+/// gives the transient window time to clear first. We never take focus, never
+/// send anything, and still refuse outright if the dialog has not returned.
+///
+/// The previous run at 16:01:08 succeeded only because its poll tick happened
+/// not to land inside the transition. That is luck, not behaviour.
+fn await_dialog_foreground(
+    state: &crate::state::AppState,
+    dialog_hwnd: u32,
+    budget_ms: u64,
+) -> bool {
+    let deadline =
+        std::time::Instant::now() + std::time::Duration::from_millis(budget_ms);
+    loop {
+        if dialog_still_foreground(state, dialog_hwnd) {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
 /// v0.5.7 F-0 helper — read an element's current ValuePattern text, if any.
 fn read_edit_value(edit: &IUIAutomationElement) -> Option<String> {
     let value: IUIAutomationValuePattern =
@@ -360,6 +436,41 @@ fn write_edit_value(edit: &IUIAutomationElement, text: &str) -> bool {
         Ok(v) => unsafe { v.SetValue(&BSTR::from(text)) }.is_ok(),
         Err(_) => false,
     }
+}
+
+/// v0.5.8 BUG-2 — put the user's OWN filename back and PROVE it stuck.
+///
+/// Returns true only when a read-back shows the box now holds exactly
+/// `original`. "SetValue returned Ok" is NOT accepted as proof: the whole
+/// class of bug this closes is precisely a SetValue that reports success and
+/// then loses a race with the dialog's own input handling.
+///
+/// Two attempts with a short gap, because a single retry immediately after the
+/// first write can lose to the same race twice.
+fn restore_filename_verified(edit: &IUIAutomationElement, original: &str) -> bool {
+    for attempt in 1..=2u32 {
+        if !write_edit_value(edit, original) {
+            warn!("v0.5.8 restore: SetValue('{original}') rejected on attempt {attempt}");
+        }
+        // Read-back is the only accepted proof of success.
+        match read_edit_value(edit) {
+            Some(after) if after == original => {
+                info!("v0.5.8 restore: filename box verified back to '{original}' (attempt {attempt})");
+                return true;
+            }
+            Some(after) => {
+                warn!(
+                    "v0.5.8 restore: attempt {attempt} left '{after}' in the filename box \
+                     (wanted '{original}')"
+                );
+            }
+            None => {
+                warn!("v0.5.8 restore: attempt {attempt} could not read the filename box back");
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(40));
+    }
+    false
 }
 
 /// v0.5.7 F-0 — SendInput Ctrl+L + Home+Shift+End + path, THEN guarded Enter.
@@ -476,7 +587,7 @@ fn try_send_path_via_sendinput(
             make_key(VK_L.0, KEYEVENTF_KEYUP.0),
             make_key(VK_CONTROL.0, KEYEVENTF_KEYUP.0),
         ];
-        if !dialog_still_foreground(state, dialog_hwnd) {
+        if !await_dialog_foreground(state, dialog_hwnd, ACTIVATION_WAIT_MS) {
             warn!("v0.5.7 H1: dialog {dialog_hwnd} stopped being foreground before Ctrl+L (BUG-1)");
             return false;
         }
@@ -488,30 +599,43 @@ fn try_send_path_via_sendinput(
         // Let the location bar materialise before we try to address it.
         std::thread::sleep(std::time::Duration::from_millis(120));
 
+        // v0.5.8: the location bar only exists once the dialog is really the
+        // foreground window. During an activation transition
+        // `GetGUIThreadInfo` reports the transient `ForegroundStaging` window
+        // and focus is unresolvable, which used to drop us straight to the
+        // keystroke path and then to a non-navigating H2. Give the transition
+        // time to clear before deciding DIRECT-1 is unavailable.
         let mut direct_ok = false;
-        if let Some(loc) = foreground_focus_element() {
-            if write_edit_value(&loc, target_path) {
-                // Read-back: only believe the replacement if it actually stuck.
-                if read_edit_value(&loc).as_deref() == Some(target_path) {
-                    direct_ok = true;
-                    info!(
-                        "v0.5.7 H1 DIRECT: address bar replaced via UIA SetValue \
-                         (no keystrokes), target='{target_path}'"
-                    );
-                } else {
-                    warn!(
-                        "v0.5.7 H1: SetValue reported success but read-back differs; \
-                         falling back to keystrokes"
-                    );
-                }
+        for _ in 0..=ACTIVATION_ATTEMPTS {
+            if !await_dialog_foreground(state, dialog_hwnd, ACTIVATION_WAIT_MS) {
+                break;
             }
-        } else {
-            debug!("v0.5.7 H1: no focus element resolvable; falling back to keystrokes");
+            if let Some(loc) = foreground_focus_element() {
+                if write_edit_value(&loc, target_path) {
+                    // Read-back: only believe the replacement if it actually stuck.
+                    if read_edit_value(&loc).as_deref() == Some(target_path) {
+                        direct_ok = true;
+                        info!(
+                            "v0.5.7 H1 DIRECT: address bar replaced via UIA SetValue \
+                             (no keystrokes), target='{target_path}'"
+                        );
+                        break;
+                    } else {
+                        warn!(
+                            "v0.5.7 H1: SetValue reported success but read-back differs; \
+                             falling back to keystrokes"
+                        );
+                    }
+                }
+            } else {
+                debug!("v0.5.7 H1: no focus element resolvable yet; retrying through activation transition");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(30));
         }
 
         if direct_ok {
             // Jump straight to the Enter step (guarded) further down.
-            if !dialog_still_foreground(state, dialog_hwnd) {
+            if !await_dialog_foreground(state, dialog_hwnd, ACTIVATION_WAIT_MS) {
                 warn!("v0.5.7 H1: dialog {dialog_hwnd} lost foreground after direct set (BUG-1)");
                 return true;
             }
@@ -581,7 +705,7 @@ fn try_send_path_via_sendinput(
 
         // v0.5.7 BUG-1 gate #1 — last possible moment before any keystroke.
         // The check at the top of this function is ~300ms stale by now.
-        if !dialog_still_foreground(state, dialog_hwnd) {
+        if !await_dialog_foreground(state, dialog_hwnd, ACTIVATION_WAIT_MS) {
             warn!(
                 "v0.5.7 H1: dialog {dialog_hwnd} stopped being foreground during \
                  the UIA scan; ABORTING before dispatching any keys (BUG-1)"
@@ -671,7 +795,7 @@ fn try_send_path_via_sendinput(
         // reached a chat window and SENT A MESSAGE. The keys above already
         // landed in the dialog (gate #1 proved it was foreground then), so we
         // only need to make sure the user has not walked away since.
-        if !dialog_still_foreground(state, dialog_hwnd) {
+        if !await_dialog_foreground(state, dialog_hwnd, ACTIVATION_WAIT_MS) {
             warn!(
                 "v0.5.7 H1: dialog {dialog_hwnd} stopped being foreground while the \
                  keystrokes were in flight; SKIPPING Enter (BUG-1)"
@@ -718,6 +842,19 @@ fn try_send_path_via_sendinput(
 ///
 /// 50ms gap between the two SetValue calls: most users cannot perceive
 /// this (Mavis D7 [LOW]); U-V3 is the explicit user-verification task.
+///
+/// ===== v0.5.8 — the "假成功" known limitation is now closed =====
+///
+/// This used to return `true` purely because both `SetValue` calls returned
+/// `Ok`. That is a statement about the API accepting the call, not about the
+/// dialog's state, so the sidecar kept reporting `Injection succeeded via UI
+/// Automation` even when the filename box was left holding a path. That is
+/// the same blind faith that let BUG-2 through.
+///
+/// Now the restore is verified by read-back. A failed restore returns `false`,
+/// which drops through to F3 — and F3 now restores and verifies too, so every
+/// path out of this function leaves the filename box clean or says loudly
+/// that it could not.
 fn try_h2_restore_filename(edit: &IUIAutomationElement, target_path: &str) -> bool {
     let value: IUIAutomationValuePattern = unsafe {
         match edit.GetCurrentPatternAs(UIA_ValuePatternId) {
@@ -744,13 +881,18 @@ fn try_h2_restore_filename(edit: &IUIAutomationElement, target_path: &str) -> bo
     // Brief settle so Chromium's internal address-bar parser runs.
     std::thread::sleep(std::time::Duration::from_millis(50));
 
-    // Step 2: restore original filename so the visible field is clean.
-    if let Err(e) = unsafe { value.SetValue(&BSTR::from(original_filename.as_str())) } {
-        warn!("v0.5.1 H2: SetValue restore filename failed: {e:?}");
+    // Step 2: restore the original filename AND verify the restore took.
+    // Same proven helper the F3 baseline uses (v0.5.8 BUG-2 fix).
+    if !restore_filename_verified(edit, &original_filename) {
+        error!(
+            "v0.5.8 H2: restore of filename box to '{original_filename}' did NOT stick \
+             (now '{:?}'); reporting failure instead of a false success",
+            read_edit_value(edit)
+        );
         return false;
     }
     info!(
-        "v0.5.1 H2: target_path written and original filename restored ({} bytes)",
+        "v0.5.1 H2: target_path written and original filename restored+verified ({} bytes)",
         original_filename.len()
     );
     true
@@ -875,6 +1017,29 @@ pub fn inject_folder_path(
     if target_path.trim().is_empty() {
         error!("target path is empty");
         return DialogOutcome::Invalid;
+    }
+
+    // v0.5.8 dead-HWND fix — check liveness ONCE, up front.
+    //
+    // The registry intentionally keeps dialogs after `DialogEvent::Closed` so a
+    // foreground flicker does not lose the write target (see main.rs, round
+    // 19c). The cost of that choice is that genuinely destroyed windows stay in
+    // the registry forever, and every later write walked the whole UIA fallback
+    // chain — COM probe, ~300ms element scan, SetValue — only to fail at the
+    // end and be reported as `unsupported_dialog_type`. That produced 31 bogus
+    // `unsupported_dialog_type` events across the recorded history and bumped
+    // the counter the extension turns into a user-facing "this dialog is not
+    // supported" notification. None of those 31 described an unsupported dialog.
+    //
+    // The check must be here, at the entry, and NOT at the end of the chain:
+    // by the time UIA has finished scanning we may be looking at a recycled
+    // handle belonging to someone else's window.
+    if !unsafe { IsWindow(Some(HWND(dialog_hwnd as *mut core::ffi::c_void))) }.as_bool() {
+        warn!(
+            "v0.5.8: dialog hwnd={dialog_hwnd} is no longer a window \
+             (destroyed or handle recycled); skipping injection entirely"
+        );
+        return DialogOutcome::DialogGone;
     }
 
     info!(
@@ -1034,16 +1199,79 @@ fn inject_via_uia(
 
     // F3 — v0.5.0 baseline: SetValue 1001. v0.5.1 does NOT auto-Invoke Save
     // even here — the user's complaint applies to every fallback layer.
+    //
+    // ===== v0.5.8 BUG-2 FIX — this WAS the confirmed root cause =====
+    //
+    // The baseline used to write the FULL target path into the filename box
+    // and LEAVE IT THERE. That single line is what produced the 2026-10-08
+    // report in docs/known-issues-2026-10-08.md: the box ended up holding
+    // `线上培训\第4次线上培训纪要_2026-10-08`, and pressing Save produced
+    // Windows' "路径不存在" (BUG-3, a pure downstream effect of this).
+    //
+    // EVIDENCE that this line and not H2 is the culprit (2026-10-08, full-log
+    // distribution, not last-N):
+    //   - `UIA SetValue OK on automation_id='1001'` (this statement) has fired
+    //     exactly 5 times in ALL history. #5 was at 2026-10-08T05:09:23Z —
+    //     the exact moment the user's filename box was first observed dirty.
+    //   - In that same window H1 SUCCEEDED every single time and H2 never ran
+    //     at all. The old doc blamed "H2 restore raced the dialog's own input
+    //     handling"; the logs show H2 was not involved.
+    //   - H2's last execution anywhere in the logs is 2026-10-07T07:24Z,
+    //     before the F-1 foreground fix made H1 stop aborting into it.
+    //
+    // WHY this line is reached at all: the whole H1 -> H2 chain is gated on
+    // `is_winui3_wrapped`. On the FIRST injection into a freshly opened
+    // dialog the `FileNameControlHost` / `50003` marker is not in the UIA tree
+    // yet, so the wrapper is not detected, the H1/H2 chain is skipped, and
+    // control falls straight through here — i.e. F3 runs exactly when the
+    // dialog is least ready. That race is the reason to fix this line rather
+    // than only logging.
+    //
+    // The fix is the same contract H2 has always had, minus the blind faith:
+    // put the path in, let the dialog parse it, take the field BACK, and prove
+    // the take-back stuck. Navigation, if it was going to happen, committed
+    // during the gap; what we refuse to do is leave the user's field dirty.
     let edit = best_edit.ok_or_else(|| Error::from(E_FAIL))?;
     let value: IUIAutomationValuePattern =
         unsafe { edit.GetCurrentPatternAs(UIA_ValuePatternId)? };
+
+    // Snapshot BEFORE writing, so the restore target is the USER's filename and
+    // not whatever we happen to have put there a moment ago.
+    let original_filename: String = unsafe { value.CurrentValue() }
+        .unwrap_or_default()
+        .to_string();
+
     unsafe { value.SetValue(&BSTR::from(target_path))? };
-    debug!(
-        "UIA SetValue OK on automation_id='{}' name='{}' target='{}'",
+    info!(
+        "UIA SetValue OK on automation_id='{}' name='{}' target='{}' (BUG-2: will restore original)",
         current_automation_id(&edit),
         current_name(&edit),
         target_path
     );
+
+    // Give the dialog the same settle window H2 uses so its own parser runs.
+    std::thread::sleep(std::time::Duration::from_millis(50));
+
+    if original_filename.is_empty() {
+        // A fresh Save As dialog has no filename yet. There is nothing to give
+        // back, and putting the folder path there is the v0.5.0 contract the
+        // user accepted on 9-27. Log it so it is visible rather than silent.
+        info!(
+            "v0.5.8 F3: filename box was empty; leaving target path in place \
+             (fresh dialog, nothing to restore)"
+        );
+    } else if !restore_filename_verified(&edit, &original_filename) {
+        // Read-back proved the field is still dirty after two attempts.
+        // Do NOT bump unsupported_dialog_count: the dialog was reachable and we
+        // did navigate it; this is our own cleanup failing, not an unsupported
+        // dialog type. A wrong counter here would fire the user's "dialog not
+        // supported" notification for something it does not describe.
+        error!(
+            "v0.5.8 F3 BUG-2: could NOT restore filename box to '{original_filename}' \
+             (now '{:?}') - the path may still be polluting the user's field",
+            read_edit_value(&edit)
+        );
+    }
 
     // v0.5.1: should_commit is ignored at the injection layer — the user
     // wants manual save confirmation for every code path. (The should_commit
@@ -1262,6 +1490,9 @@ mod tests {
             DialogOutcome::AddressBarWritten,
             DialogOutcome::Unsupported,
             DialogOutcome::Invalid,
+            // v0.5.8: added for the dead-HWND fix. Distinct from Unsupported
+            // precisely so the two can never be conflated downstream.
+            DialogOutcome::DialogGone,
         ];
         for (i, a) in outcomes.iter().enumerate() {
             for (j, b) in outcomes.iter().enumerate() {
@@ -1300,6 +1531,47 @@ mod tests {
             initial_unsupported,
             "Invalid outcome must not bump unsupported_dialog_count"
         );
+    }
+
+    /// v0.5.8 dead-HWND regression: a handle that is not a window must be
+    /// rejected AT THE ENTRY, and — the property that actually matters — it
+    /// must NOT bump `unsupported_dialog_count`.
+    ///
+    /// Why the second assertion is the important one: the whole point of the
+    /// distinct `DialogGone` variant is that a destroyed window is a
+    /// bookkeeping event, not a "this dialog type is unsupported" event. If
+    /// this counter moves, the extension raises the user's "Save As dialog
+    /// could not be navigated" notification for something that did not
+    /// happen — the exact false report seen 31 times in the recorded history.
+    #[test]
+    fn inject_folder_path_dead_hwnd_returns_dialog_gone_and_does_not_count() {
+        use crate::state::AppState;
+        let state = AppState::new("C:\\".into(), 1);
+        let initial_unsupported = state.health_snapshot().unsupported_dialog_count;
+
+        // 0xFFFFFFFF is not a valid HWND in this process, so IsWindow fails.
+        // The empty-target guard is deliberately NOT what we are testing, so
+        // the path argument is non-empty and hwnd is non-zero.
+        let outcome = inject_folder_path(&state, 0xFFFF_FF00u32, "C:\\downloads", false);
+
+        assert_eq!(
+            outcome,
+            DialogOutcome::DialogGone,
+            "a dead handle must short-circuit to DialogGone before any UIA work"
+        );
+        assert_eq!(
+            state.health_snapshot().unsupported_dialog_count,
+            initial_unsupported,
+            "DialogGone must NOT bump unsupported_dialog_count (v0.5.8 hard constraint)"
+        );
+    }
+
+    /// v0.5.8: the DialogGone variant must not equal Unsupported, or the two
+    /// would collapse back into one indistinguishable bucket downstream.
+    #[test]
+    fn dialog_gone_is_distinct_from_unsupported() {
+        assert_ne!(DialogOutcome::DialogGone, DialogOutcome::Unsupported);
+        assert_ne!(DialogOutcome::DialogGone, DialogOutcome::Invalid);
     }
 
     // ----------------------------------------------------------------------
