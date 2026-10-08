@@ -95,9 +95,9 @@
     ]
   },
   "scripts": {
-    "build": "rollup -c rollup.config.mjs",
-    "typecheck": "tsc --noEmit",
-    "watch": "rollup -c rollup.config.mjs -w"
+    "build": "node ./scripts/refuse-legacy-build.mjs",
+    "watch": "node ./scripts/refuse-legacy-build.mjs",
+    "typecheck": "tsc --noEmit"
   },
   "devDependencies": {
     "@rollup/plugin-node-resolve": "^15.2.3",

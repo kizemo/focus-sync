@@ -68,9 +68,27 @@ sidecar 由 **Windows 计划任务 `KizemoFocusSync`** 启动(登录时),与 Sig
 | 组件 | 位置 | 规模 | 说明 |
 |---|---|---|---|
 | sidecar | `sigma-listary-spike/` | 13 文件 / ~3.9k 行 Rust | crate `sigma-listary-spike`,产物名 `spike` |
-| 插件 | `release/extension/` | `dist/index.js` ~686 行 | ESM,`onStartup` 激活 |
+| 插件 | `release/extension/dist/index.js` | ~726 行 JS | ESM,`onStartup` 激活。**手工维护,唯一真相源** |
 | 安装器 | `release/extension-installer/` | NSIS + 10 个 PS 脚本 | 计划任务的建/删 |
 | 工具链 | `scripts/` | 5 个脚本 | 沙箱扫描 + 日志读取 |
+
+> ### ⚠️ `extension/` 目录不是插件源码
+>
+> `extension/src/index.ts` 是 **v0.3.0 之前的 spawn 架构**(用 `sigma.binary`
+> 亲自拉起 sidecar),而插件实际用的是 **Scheduled Task 架构**(v0.5.5)。
+> **两者不是新旧版本关系,是两条设计路线。**
+>
+> 从 `src` 构建会覆盖掉 `dist`,丢掉 v0.3.0 → v0.5.5 的全部修复。
+> `npm run build` 已被改为**直接拒绝执行**。
+> 详见 [`extension/BUILD-LEGACY.md`](extension/BUILD-LEGACY.md)。
+
+### 改插件的正确方式
+
+直接编辑 `release/extension/dist/index.js`,然后**必须**跑沙箱门禁:
+
+```powershell
+node scripts\scan-sandbox-dynamic.cjs release\extension\dist\index.js
+```
 
 ### 插件权限(最小集)
 
