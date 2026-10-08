@@ -1,14 +1,16 @@
 # 已知缺陷登记 — focus-sync v0.5.5 / v0.5.7
 
 **登记时间**:2026-10-08 13:11
-**状态**:已记录,**暂不修复**(按用户指示,先完成仓库收口,再处理同步问题)
+**最后更新**:2026-10-08 13:30(BUG-1 已修复并部署,待用户验证)
+**状态**:BUG-1 已修复待验证;BUG-2 / BUG-3 未修
 **当前基线**:`focus-sync-v0.5.7-working` 标签对应的实现(同步功能实测可用)
 
 ---
 
-## BUG-1 ★ 注入逃逸到非对话框窗口,并自动触发回车
+## BUG-1 ★ 注入逃逸到非对话框窗口,并自动触发回车 —— ✅ 已修复(待验证)
 
 **严重度:高(安全)** —— 它能向任意前台应用输入文本并触发回车键。
+**修复时间**:2026-10-08 13:30
 
 ### 现象(用户直接观察,非日志推断)
 
@@ -36,6 +38,43 @@ T0+300ms  H1 执行 SendInput:Ctrl+L → 路径 → Enter
 
 **缺失的检查**:SendInput 之前,必须确认**当前前台 HWND 仍等于目标对话框 HWND**,
 而且必须**在发送的同一时刻**验证(而不是 300ms 前)。
+
+### ✅ 修复内容(v0.5.7 BUG-1)
+
+新增 `uia_inject.rs::dialog_still_foreground(state, dialog_hwnd)`,在**两个**
+`SendInput` 调用点前**各校验一次**:
+
+```
+UIA 扫描 ~300ms
+  ↓
+[闸门 1] dialog_still_foreground?  ← 不通过则一个按键都不发,return false
+  ↓
+SendInput 批次1(Ctrl+L / End / Back×128 / 路径)
+  ↓
+80ms sleep + 两道原有护栏
+  ↓
+[闸门 2] dialog_still_foreground?  ← 不通过则跳过 Enter,return true
+  ↓
+SendInput 批次2(Enter)
+```
+
+校验内容两条,同时满足:
+1. `IsWindow(hwnd)` —— 对话框没被销毁(句柄可能被复用)
+2. `state.foreground_dialog() == hwnd` —— monitor 发布的值,每次轮询刷新(≤8ms 新鲜度)
+
+**刻意不使用 `GetForegroundWindow()`**:本代码跑在无消息泵的 HTTP 线程上,
+该调用返回过与 monitor 矛盾的值(见 F-1 记录)。
+
+**返回值的语义选择**:
+- 闸门 1 不过 → `return false` → 不发任何按键,交回 H2 回退
+- 闸门 2 不过 → `return true` → 地址栏已填好,**不**落回 H2
+  (否则会往用户已不再注视的对话框的文件名框里写东西)
+
+**验证清单(修复后待确认)**:
+- [ ] 在 Sigma FM 切目录后**立刻**切到聊天窗口 → 聊天窗口**不得**收到任何输入
+- [ ] 日志出现 `ABORTING before dispatching any keys (BUG-1)` 或
+      `SKIPPING Enter (BUG-1)` —— 说明闸门确实拦下了一次
+- [ ] 地址栏导航仍然生效(不能为了修 BUG-1 把功能整体关掉)
 
 ---
 

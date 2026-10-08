@@ -79,6 +79,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     // cares about: "is focus still on the address bar, or did it jump back
     // to the filename box?".
     GetGUIThreadInfo, GetWindowThreadProcessId, GUITHREADINFO,
+    // v0.5.7 BUG-1: liveness check for the dialog HWND right before every SendInput.
+    IsWindow,
 };
 // v0.5.1 (Mavis 第 13 轮 D2 [HIGH]): complete SendInput helper imports.
 // windows-rs 0.62 names the keyboard-flag newtype `KEYBD_EVENT_FLAGS`
@@ -290,6 +292,41 @@ fn path_landed_in_filename_box(before: Option<&str>, after: Option<&str>) -> boo
     }
 }
 
+/// v0.5.7 BUG-1 — is the target dialog STILL the foreground window *right now*?
+///
+/// Must be called IMMEDIATELY before every `SendInput` batch, never once at the
+/// top of the injection.
+///
+/// WHY (observed 2026-10-08 13:10): the foreground check at the top of
+/// `try_send_path_via_sendinput` goes stale before any keystroke is emitted.
+/// The UIA element scan in between costs ~300ms, and `SendInput` always
+/// dispatches to whatever window is foreground AT SEND TIME — not to the
+/// window we checked. The user switched to a chat window while an injection
+/// was queued; the path was typed into that window and **Enter sent a
+/// message**. This helper closes that window.
+///
+/// Two conditions, both required:
+///   1. the dialog HWND still exists (`IsWindow`) — the dialog may have been
+///      destroyed and the handle recycled;
+///   2. the monitor-published foreground still equals it. The monitor thread
+///      republishes every ~8ms while tracking, so a read here is at most one
+///      poll interval stale — versus ~300ms for a check at function entry.
+///
+/// Deliberately does NOT call `GetForegroundWindow()`: this code runs on the
+/// HTTP thread, which has no Windows message pump, and that call returned
+/// values that disagreed with the monitor's (see F-1 notes).
+fn dialog_still_foreground(state: &crate::state::AppState, dialog_hwnd: u32) -> bool {
+    if dialog_hwnd == 0 {
+        return false;
+    }
+    let h = HWND(dialog_hwnd as *mut core::ffi::c_void);
+    // windows-0.62: IsWindow(Option<HWND>) -> BOOL
+    if !unsafe { IsWindow(Some(h)) }.as_bool() {
+        return false;
+    }
+    state.foreground_dialog() == dialog_hwnd
+}
+
 /// v0.5.7 F-0 helper — read an element's current ValuePattern text, if any.
 fn read_edit_value(edit: &IUIAutomationElement) -> Option<String> {
     let value: IUIAutomationValuePattern =
@@ -446,6 +483,16 @@ fn try_send_path_via_sendinput(
         // UIA works cross-process; the old GetFocus() check did not (see fn doc).
         let filename_before: Option<String> = best_edit.and_then(read_edit_value);
 
+        // v0.5.7 BUG-1 gate #1 — last possible moment before any keystroke.
+        // The check at the top of this function is ~300ms stale by now.
+        if !dialog_still_foreground(state, dialog_hwnd) {
+            warn!(
+                "v0.5.7 H1: dialog {dialog_hwnd} stopped being foreground during \
+                 the UIA scan; ABORTING before dispatching any keys (BUG-1)"
+            );
+            return false;
+        }
+
         let n = SendInputFn(&inputs, std::mem::size_of::<INPUT>() as i32);
         let total = inputs.len() as u32;
         if n != total {
@@ -520,6 +567,23 @@ fn try_send_path_via_sendinput(
                  after typing; SKIPPING Enter to avoid triggering Save"
             );
             return true; // H1 did fill the address bar; user can press Enter
+        }
+
+        // v0.5.7 BUG-1 gate #2 — last possible moment before Enter.
+        //
+        // Enter is the most dangerous key we send: in the reported incident it
+        // reached a chat window and SENT A MESSAGE. The keys above already
+        // landed in the dialog (gate #1 proved it was foreground then), so we
+        // only need to make sure the user has not walked away since.
+        if !dialog_still_foreground(state, dialog_hwnd) {
+            warn!(
+                "v0.5.7 H1: dialog {dialog_hwnd} stopped being foreground while the \
+                 keystrokes were in flight; SKIPPING Enter (BUG-1)"
+            );
+            // Return true: the address bar was filled in the dialog, and we
+            // deliberately do NOT fall through to H2 (which would write the
+            // filename box of a dialog the user is no longer looking at).
+            return true;
         }
 
         let enter_inputs: Vec<INPUT> = vec![
