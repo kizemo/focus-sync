@@ -305,12 +305,21 @@ fn path_landed_in_filename_box(before: Option<&str>, after: Option<&str>) -> boo
 /// was queued; the path was typed into that window and **Enter sent a
 /// message**. This helper closes that window.
 ///
-/// Two conditions, both required:
-///   1. the dialog HWND still exists (`IsWindow`) — the dialog may have been
-///      destroyed and the handle recycled;
-///   2. the monitor-published foreground still equals it. The monitor thread
-///      republishes every ~8ms while tracking, so a read here is at most one
-///      poll interval stale — versus ~300ms for a check at function entry.
+/// THREE INDEPENDENT CONDITIONS, all required:
+///
+///   1. `IsWindow(hwnd)` — the dialog must not have been destroyed and its
+///      handle recycled for an unrelated window.
+///   2. `state.foreground_dialog() == hwnd` — the monitor thread republishes
+///      every ~8ms while tracking, so this read is at most one poll interval
+///      stale, versus ~300ms for a check at function entry.
+///   3. `detector::is_file_dialog(hwnd)` — an **independent** structural
+///      re-verification: class `#32770` + a file-dialog title + real file
+///      browser child classes. This one does NOT consult monitor state at all,
+///      so it cannot inherit a monitor mistake.
+///
+/// Condition 3 is spike's own `detector::is_file_dialog`, which existed since
+/// the original port (8016f3de) and had **zero call sites** until now. It was
+/// dead code that happened to be exactly the send-time re-check this bug needed.
 ///
 /// Deliberately does NOT call `GetForegroundWindow()`: this code runs on the
 /// HTTP thread, which has no Windows message pump, and that call returned
@@ -322,6 +331,10 @@ fn dialog_still_foreground(state: &crate::state::AppState, dialog_hwnd: u32) -> 
     let h = HWND(dialog_hwnd as *mut core::ffi::c_void);
     // windows-0.62: IsWindow(Option<HWND>) -> BOOL
     if !unsafe { IsWindow(Some(h)) }.as_bool() {
+        return false;
+    }
+    // 3rd condition — structural re-check, independent of the monitor.
+    if !crate::detector::is_file_dialog(dialog_hwnd as isize) {
         return false;
     }
     state.foreground_dialog() == dialog_hwnd
