@@ -68,26 +68,30 @@ sidecar 由 **Windows 计划任务 `KizemoFocusSync`** 启动(登录时),与 Sig
 | 组件 | 位置 | 规模 | 说明 |
 |---|---|---|---|
 | sidecar | `sigma-listary-spike/` | 13 文件 / ~3.9k 行 Rust | crate `sigma-listary-spike`,产物名 `spike` |
-| 插件 | `release/extension/dist/index.js` | ~726 行 JS | ESM,`onStartup` 激活。**手工维护,唯一真相源** |
+| **插件** | **`release/extension/dist/index.js`** | ~726 行 JS | ESM,`onStartup` 激活。**唯一真相源,手工维护** |
 | 安装器 | `release/extension-installer/` | NSIS + 10 个 PS 脚本 | 计划任务的建/删 |
 | 工具链 | `scripts/` | 5 个脚本 | 沙箱扫描 + 日志读取 |
 
-> ### ⚠️ `extension/` 目录不是插件源码
+> ### ⚠️ 插件没有 TypeScript 构建链 —— 这是有意的
 >
-> `extension/src/index.ts` 是 **v0.3.0 之前的 spawn 架构**(用 `sigma.binary`
-> 亲自拉起 sidecar),而插件实际用的是 **Scheduled Task 架构**(v0.5.5)。
-> **两者不是新旧版本关系,是两条设计路线。**
+> 仓库曾有一个 `extension/` 目录,里面是 **pre-v0.3.0 的 spawn 架构**
+> (用 `sigma.binary` 亲自拉起 sidecar)。而插件实际用的是 **Scheduled Task 架构**(v0.5.5)。
+> **两者不是新旧版本,是两条设计路线。**
 >
-> 从 `src` 构建会覆盖掉 `dist`,丢掉 v0.3.0 → v0.5.5 的全部修复。
-> `npm run build` 已被改为**直接拒绝执行**。
-> 详见 [`extension/BUILD-LEGACY.md`](extension/BUILD-LEGACY.md)。
+> 用它构建会覆盖 `dist/index.js`,丢掉 v0.3.0 → v0.5.5 的全部修复
+> (sandbox 门禁、焦点归属、有护栏的地址栏导航)。
+> 该目录已于 2026-10-08 **删除**,以杜绝误用。
+>
+> 恢复 TypeScript 构建链是一项独立工程:需要先把 `dist/index.js` 反向整理成
+> 等价的 TypeScript,再让 rollup 接管。**在此之前,手工维护 `dist` 是唯一安全的选择。**
 
-### 改插件的正确方式
+### 改插件的唯一正确方式
 
-直接编辑 `release/extension/dist/index.js`,然后**必须**跑沙箱门禁:
-
-```powershell
+```bash
+# 1. 直接编辑 release/extension/dist/index.js
+# 2. 改完必须跑沙箱门禁
 node scripts\scan-sandbox-dynamic.cjs release\extension\dist\index.js
+#    期望:VALID (0 violations / 19 patterns)
 ```
 
 ### 插件权限(最小集)
