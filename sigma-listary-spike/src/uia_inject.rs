@@ -250,7 +250,9 @@ fn make_unicode_release(ch: u16) -> INPUT {
 ///
 /// Returns `None` when the answer cannot be determined (no foreground window,
 /// `GetGUIThreadInfo` refused, focus HWND is null, or UIA could not resolve it).
-fn foreground_focus_automation_id() -> Option<String> {
+/// v0.5.7 DIRECT-1 - the UIA element that currently holds keyboard focus in
+/// the foreground window, if resolvable.
+fn foreground_focus_element() -> Option<IUIAutomationElement> {
     unsafe {
         let fg = GetForegroundWindow();
         if fg.0.is_null() {
@@ -271,9 +273,12 @@ fn foreground_focus_automation_id() -> Option<String> {
             return None;
         }
         let uia = automation()?;
-        let elem = uia.ElementFromHandle(gi.hwndFocus).ok()?;
-        Some(current_automation_id(&elem))
+        uia.ElementFromHandle(gi.hwndFocus).ok()
     }
+}
+
+fn foreground_focus_automation_id() -> Option<String> {
+    foreground_focus_element().map(|e| current_automation_id(&e))
 }
 
 /// v0.5.7 F-0 — pure decision function for the Enter guard.
@@ -449,16 +454,94 @@ fn try_send_path_via_sendinput(
             return false;
         }
 
-        // Mavis O2 (第 18 轮): Vec capacity should match actual push count.
-        // Actual: 4 (Ctrl+L) + 6 (Home+Shift+End) + 2N (path press+release) = 10 + 2N.
-        let mut inputs: Vec<INPUT> =
-            Vec::with_capacity(10 + target_path.encode_utf16().count() * 2);
+        // ===== v0.5.7 DIRECT-1: replace the keystroke storm with one SetValue =====
+        //
+        // Until now a single injection emitted ~290-340 INPUT events:
+        //   Ctrl+L, End, 128 x Backspace, then one press+release per path char.
+        // The 128 Backspaces are what the user sees as "the address bar clears
+        // itself, then the path types itself in". It is also the ugliest part
+        // of the feature.
+        //
+        // Better: focus the location bar (4 events), then ask UIA to SET its
+        // value outright. One call, no visible deletion, no per-character
+        // synthesis, and no dependence on which keys the dialog intercepts.
+        //
+        // We only take this route if a read-back proves the value landed, so a
+        // dialog whose location bar does not expose ValuePattern simply falls
+        // through to the keystroke path below (which is the current,
+        // already-working behaviour). Nothing regresses.
+        let focus_inputs: Vec<INPUT> = vec![
+            make_key(VK_CONTROL.0, 0),
+            make_key(VK_L.0, 0),
+            make_key(VK_L.0, KEYEVENTF_KEYUP.0),
+            make_key(VK_CONTROL.0, KEYEVENTF_KEYUP.0),
+        ];
+        if !dialog_still_foreground(state, dialog_hwnd) {
+            warn!("v0.5.7 H1: dialog {dialog_hwnd} stopped being foreground before Ctrl+L (BUG-1)");
+            return false;
+        }
+        let fnum = SendInputFn(&focus_inputs, std::mem::size_of::<INPUT>() as i32);
+        if fnum as u32 != focus_inputs.len() as u32 {
+            warn!("v0.5.7 SendInput: Ctrl+L not accepted ({fnum}/4); falling back");
+            return false;
+        }
+        // Let the location bar materialise before we try to address it.
+        std::thread::sleep(std::time::Duration::from_millis(120));
 
-        // Step 4: Ctrl+L — focus Chromium's address bar.
-        inputs.push(make_key(VK_CONTROL.0, 0));
-        inputs.push(make_key(VK_L.0, 0));
-        inputs.push(make_key(VK_L.0, KEYEVENTF_KEYUP.0));
-        inputs.push(make_key(VK_CONTROL.0, KEYEVENTF_KEYUP.0));
+        let mut direct_ok = false;
+        if let Some(loc) = foreground_focus_element() {
+            if write_edit_value(&loc, target_path) {
+                // Read-back: only believe the replacement if it actually stuck.
+                if read_edit_value(&loc).as_deref() == Some(target_path) {
+                    direct_ok = true;
+                    info!(
+                        "v0.5.7 H1 DIRECT: address bar replaced via UIA SetValue \
+                         (no keystrokes), target='{target_path}'"
+                    );
+                } else {
+                    warn!(
+                        "v0.5.7 H1: SetValue reported success but read-back differs; \
+                         falling back to keystrokes"
+                    );
+                }
+            }
+        } else {
+            debug!("v0.5.7 H1: no focus element resolvable; falling back to keystrokes");
+        }
+
+        if direct_ok {
+            // Jump straight to the Enter step (guarded) further down.
+            if !dialog_still_foreground(state, dialog_hwnd) {
+                warn!("v0.5.7 H1: dialog {dialog_hwnd} lost foreground after direct set (BUG-1)");
+                return true;
+            }
+            let direct_enter: Vec<INPUT> = vec![
+                make_key(VK_RETURN as u16, 0),
+                make_key(VK_RETURN as u16, KEYEVENTF_KEYUP.0),
+            ];
+            let de = SendInputFn(&direct_enter, std::mem::size_of::<INPUT>() as i32);
+            if de as u32 == direct_enter.len() as u32 {
+                info!("v0.5.7 H1 committed (direct path): Enter sent (navigation only)");
+            } else {
+                warn!("v0.5.7 SendInput: Enter not accepted ({de}/2) after direct set");
+            }
+            return true;
+        }
+
+        // ----- fallback: the original keystroke path (End + Backspace + type) -----
+        let mut inputs: Vec<INPUT> =
+            Vec::with_capacity(6 + target_path.encode_utf16().count() * 2);
+        inputs.push(make_key(VK_END.0, 0));
+        inputs.push(make_key(VK_END.0, KEYEVENTF_KEYUP.0));
+        for _ in 0..128 {
+            inputs.push(make_key(VK_BACK.0, 0));
+            inputs.push(make_key(VK_BACK.0, KEYEVENTF_KEYUP.0));
+        }
+        // type the path char-by-char (press + release per MSDN)
+        for ch in target_path.encode_utf16() {
+            inputs.push(make_unicode(ch));
+            inputs.push(make_unicode_release(ch));
+        }
 
         // Step 5: CLEAR the address bar, then type. (v0.5.7 G-5)
         //

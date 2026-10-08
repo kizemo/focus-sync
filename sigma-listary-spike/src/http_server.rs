@@ -238,6 +238,26 @@ fn handle_set_path(
         ts: now_iso8601(),
     });
     for d in dialogs {
+        // v0.5.7 DEDUP-1: skip a dialog that already holds this EXACT path.
+        //
+        // Observed 2026-10-08 14:02: the Opened write-back injected once, then
+        // ~2.3s later /set_path injected the SAME path into the SAME dialog
+        // again. R-2 let it through because the dialog was foreground, and the
+        // existing `path_unchanged` dedup only compares against
+        // `state.current_path` - not against "what we already wrote HERE".
+        // The user saw the address bar cleared and refilled twice.
+        if state.last_written_path(d.hwnd).as_deref() == Some(path.as_str()) {
+            log_event(&Event::SpikeError {
+                kind: "set_path_already_synced".into(),
+                message: format!(
+                    "hwnd={} app={} already holds this path; skipping redundant inject",
+                    d.hwnd, d.app
+                ),
+                ts: now_iso8601(),
+            });
+            continue;
+        }
+
         // v0.5.7 R-2 (2026-10-07, user feedback): /set_path must NOT touch a
         // BACKGROUND dialog.
         //
