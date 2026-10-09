@@ -2,6 +2,17 @@
 sigma-file-manager/
 sigma-batch-rename/
 
+# 整合包一律不进主仓 —— 它们由 fork(alpha-file-manager)仓产出。
+# 主仓只保留 Focus Sync 插件本体与它的独立安装包。
+# 计划 P1(2026-10-09)。整合包可由 fork 完整重建,已由 P0.5 验证。
+release/Sigma-File-Manager-*.exe
+release/Sigma File Manager_*.exe
+# 计划 P4 改名后整合包的新名字。安全网必须在改名那一刻仍然有效,
+# 否则规则会在最需要它的时刻静默过期。
+release/Alpha-File-Manager-*.exe
+release/Alpha File Manager_*.exe
+release/installer/
+
 # 临时下载/草稿
 *.tmp
 *.bak

@@ -1,9 +1,12 @@
 # ============================================================================
-# build.ps1 — Compile kizemo.focus-sync-0.2.0-setup.exe via NSIS
+# build.ps1 - Compile kizemo.focus-sync-0.5.8-setup.exe via NSIS
 # ============================================================================
 # Run from this directory. Output:
-#   kizemo.focus-sync-0.2.0-setup.exe  (in this directory)
+#   kizemo.focus-sync-0.5.8-setup.exe  (in this directory)
 # Also copied to ../ (release/ top-level) for visibility.
+# NOTE: the header above used to say 0.2.0 while the script emitted 0.5.8.
+# That stale comment is exactly what made the retired 0.2.0 package look
+# like a live build product. If you change $outExe, change these lines too.
 # ============================================================================
 
 $ErrorActionPreference = 'Stop'
