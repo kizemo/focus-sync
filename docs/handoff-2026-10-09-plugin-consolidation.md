@@ -11,9 +11,9 @@
 
 | 项 | 值 |
 |---|---|
-| **主仓**(发布存档) | `F:\soft\00selfmade\filemanager`,HEAD **`48ea331`**,**已推送,与 origin 一致** |
-| **品牌仓** | `…\sigma-file-manager`,分支 **`feat/plugin-source-in` @ `a3577184`**,**已推送** |
-| 品牌仓 `main` | **`9e764a16`**,**未含插件源码**(要不要合并见 §5) |
+| **主仓**(发布存档) | `F:\soft\00selfmade\filemanager`,HEAD **`758f466`**,**已推送,与 origin 一致** |
+| **品牌仓** | `F:\soft\00selfmade\filemanager\sigma-file-manager`,**分支 `main` @ `a3577184`**,**已推送** |
+| 品牌仓 `main` | **`a3577184`**,**✅ 已含插件源码** —— §5 的 A 已于 2026-10-09 完成(快进合并,见 §5.1) |
 | 两仓工作区 | **均干净** |
 | 品牌仓远程 | `https://github.com/kizemo/alpha-file-manager.git` |
 | 装机现状 | **本轮未安装任何东西**,跑的还是昨天那个已验证的安装包 |
@@ -164,17 +164,53 @@
 
 | # | 阶段 | 内容 | 阻塞? |
 |---|---|---|---|
-| **A** | **合并 `feat/plugin-source-in` → 品牌仓 `main`** | 开 PR 或直接合并。**先定这个**,否则 P4/P5 都在分支上做 | ⬅ **从这里开始** |
-| B | P4 改名 | 按计划 §3.3 改 12 处显示位。**按 §2 的真实路径核对那两个常量** | 依赖 A |
+| **A** | ~~合并 `feat/plugin-source-in` → 品牌仓 `main`~~ | ✅ **已完成** —— 快进合并,`main` = `a3577184`,已推送 | — |
+| B | P4 改名 | 按计划 §3.3 改 12 处显示位。**按 §2 的真实路径核对那两个常量** | ⬅ **从这里开始** |
 | C | P5 图标 | 候选 A `afm-v3-2-solid-teal.jpg` → 裁 1024 → `npx tauri icon`(含前后两次 `git status` 快照) | 依赖 B |
 | D | P2.5 | 树形视图代码归位 + `integration-points.yaml` 登记表 | 独立 |
 | E | P6 | 门禁脚本 + GPL 声明(README 已补 §6 源码义务) | — |
 | F | P7 | 端到端重验:构建→安装→sha 门禁→**卸载**(卸载路径至今从未验证过) | 依赖 B/C |
 
+### 5.1 ✅ A 已完成:`feat/plugin-source-in` → `main`(2026-10-09 晚)
+
+**决策:直接快进合并,不开 PR。** 理由:单仓自 fork 无评审人;待入的只有 1 个**已经过 P0.5 验证**的提交;
+快进让 `main` 与被验证过的那棵树**逐字节相同**,「main 就是验过的那个状态」可以直接审计。
+
+| 项 | 合并前 | 合并后 |
+|---|---|---|
+| 品牌仓 `main` | `9e764a16` | **`a3577184`** |
+| 与 `origin/main` | 一致 | **一致(服务器侧 `ls-remote` 已确认)** |
+
+**快进判定**:`git merge-base --is-ancestor main feat/plugin-source-in` → true,
+待入提交 **1 个**,两侧**零分叉**(feature 侧 1,main 侧 0)。
+
+**合并后实测**:
+
+| 检查 | 结果 |
+|---|---|
+| 沙箱门禁(合并后的 `main` 上跑) | **VALID(0 violations / 19 patterns,exit 0)** —— 动态从源码提取,**确认在执行而非静默跳过** |
+| 约束 23:`dist` 是否被忽略规则吞掉 | 3 个文件 `git check-ignore` 均返回「未忽略」✅ |
+| 约束 21:`installer.nsi` BOM | **`EF BB BF` 存在** ✅(17234 字节) |
+| 跨仓残留:`scripts/` + `installer.nsi` | 搜 `filemanager` / `00selfmade` / `listary-spike` / `release\extension` → **0 命中** |
+| `tauri.conf.json` `bundle.resources` | 8 条全部指向 `../extensions/kizemo.focus-sync/…`,**仓内** |
+| 载荷实际落盘 | `dist/index.js` 37144 B、`installer.nsi` 17234 B 等 6 个关键文件均在 |
+| 工作区 / 与上游差异 | CLEAN,`0  0` |
+
+**回退**:`9e764a16` 作为祖先永久可达,无需额外打 tag。
+若需回退 —— `git branch rollback-a 9e764a16`,再决定是否把 `main` 拨回去。
+
+> ⚠️ **本次未覆盖的**(别当成已验):未构建、未安装、未部署侧车。
+> `main` 与被验证的 `a3577184` 逐字节相同是**快进的构造保证**,属**平凡检查**,
+> 它证明的是「没有引入偏移」,不是「在新状态下构建通过」。真正的构建验证属 P7。
+>
+> ⚠️ **观察(非本次引入,未改)**:约束 22 要求 `.ps1` 纯 ASCII,实测 6 个 `.ps1` 含
+> `—`(U+2014)、`→`(U+2192)、`§`(U+00A7)**注释**字符,CJK 计数为 0。
+> 纯观感问题,且这些文件在 P0.5 已实测编译 0 warning。**留待 P6 门禁阶段一并清理**,勿在推送前动安装器脚本。
+
 ### 未做 / 未验证
 
 - ❌ **本轮未安装任何东西。** 「装进 `D:\Program Files\` 后一切正常」仍未验证
-- ❌ 品牌仓 `main` 尚不含插件源码
+- ✅ 品牌仓 `main` 已含插件源码(见 §5.1)
 - ❌ 改名、图标未开始
 - ❌ 卸载路径从未端到端验证
 - ❌ 扩展激活耗时 1–3 分钟根因未查
@@ -188,11 +224,13 @@
 
 | 位置 | 节点 | 说明 |
 |---|---|---|
-| **主仓** | **`48ea331`** | ★ 当前状态,**已推送** |
+| **主仓** | **`758f466`** | ★ 当前状态,**已推送** |
+| 主仓 | `48ea331` | 插件源码迁出、交接文档入库 |
 | 主仓 | `0d24f2a` | P1 瘦身后、架构调整前 |
 | 主仓 | `2109d59` | 本轮开工前 |
-| **品牌仓** | **`a3577184`** | ★ `feat/plugin-source-in`,**已推送** |
-| 品牌仓 | `9e764a16` | `main`,本轮未动 |
+| **品牌仓** | **`a3577184`** | ★ `main`(已快进合并),**已推送** —— 同一 SHA 也是 `feat/plugin-source-in` |
+| 品牌仓 | `9e764a16` | **合并前的 `main`**,作为祖先永久可达,回退锚点 |
+| 品牌仓 | `feat/dialog-focus-sync` | ⚠️ **另有 11 个提交尚未并入 `main`**,本轮未处理 |
 | 主仓 tag | `v0.5.9-packaging-20261009` | 上午的打包基线,仍有效 |
 | 磁盘 | `C:\Temp\afm-p1-baseline-2026-10-09\` | P0.5 基线产物 + 记录 |
 | 磁盘 | `C:\Temp\afm-p1-quarantine-2026-10-09\` | **本轮移走的全部东西,可回滚** |
@@ -242,9 +280,9 @@ powershell -NoProfile -ExecutionPolicy Bypass -File extensions\kizemo.focus-sync
 
 ```
 读 F:\soft\00selfmade\filemanager\docs\handoff-2026-10-09-plugin-consolidation.md(必读)。
-当前状态已固化:插件源码已并入品牌仓,主仓转为发布存档,两仓均已提交推送
-(主仓 48ea331,品牌仓 feat/plugin-source-in @ a3577184,品牌仓 main 仍是 9e764a16)。
-先做 §5 的 A:决定并执行 feat/plugin-source-in 合入品牌仓 main。
+§5 的 A 已完成:feat/plugin-source-in 已快进合入品牌仓 main,两仓均已推送
+(主仓 758f466,品牌仓 main = a3577184,与 origin 一致)。
+下一步做 §5 的 B:P4 改名。
 动代码前务必读 §2 硬约束 —— 尤其第 20 条(Rust 构建非字节可复现,侧车指纹
 不能当锚点)和第 21 条(改 .nsi 必须留 UTF-8 BOM)。
 ⚠️ 旧文档 PLAN-v3 的 P3 已作废,§3.2 标的两个互操作常量路径是错的
