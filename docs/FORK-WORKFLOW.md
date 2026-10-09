@@ -24,7 +24,7 @@ F:\soft\00selfmade\filemanager\                    ← 本目录(meta 仓库,放
 
 | 名称 | URL | 角色 |
 |---|---|---|
-| `origin` | `https://github.com/kizemo/sigma-file-manager.git` | 推送到自己的 fork |
+| `origin` | `https://github.com/kizemo/alpha-file-manager.git` | 推送到自己的 fork |
 | `upstream` | `https://github.com/aleksey-hoffman/sigma-file-manager.git` | 同步上游 Aleksey Hoffman 的官方仓库 |
 
 ## Git 身份

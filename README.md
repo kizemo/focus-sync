@@ -13,7 +13,7 @@
 | | 位置 | 说明 |
 |---|---|---|
 | **Focus Sync**(本仓库) | `sigma-listary-spike/` `release/extension/` `release/extension-installer/` | sidecar Rust 源码 + 插件本体 + NSIS 安装器 |
-| **Sigma FM fork** | [`github.com/kizemo/sigma-file-manager`](https://github.com/kizemo/sigma-file-manager) | 独立仓库,fork 自 [`aleksey-hoffman/sigma-file-manager`](https://github.com/aleksey-hoffman/sigma-file-manager)。本仓库通过 `.gitignore` 完全排除它 |
+| **Sigma FM fork** | [`github.com/kizemo/alpha-file-manager`](https://github.com/kizemo/alpha-file-manager) | 独立仓库,fork 自 [`aleksey-hoffman/sigma-file-manager`](https://github.com/aleksey-hoffman/sigma-file-manager)。本仓库通过 `.gitignore` 完全排除它 |
 
 **两者零源码耦合。** 本项目只通过 Sigma FM 的**公开扩展 API**(manifest / 沙箱 / 权限)与之交互。
 最直接的证据:沙箱规则由 [`scripts/scan-sandbox-dynamic.cjs`](scripts/scan-sandbox-dynamic.cjs)
