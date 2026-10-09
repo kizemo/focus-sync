@@ -1,5 +1,0 @@
-target/
-*.exe
-*.pdb
-*.log
-Cargo.lock.bak

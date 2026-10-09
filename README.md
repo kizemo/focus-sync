@@ -1,295 +1,84 @@
-# Focus Sync
+# Focus Sync —— 发布存档
 
-**Listary 风格的全局焦点同步 —— 让 Save As / 下载弹窗自动跟随你在 Sigma FM 里切换的目录。**
-
-你在 Sigma FM 里切换目录 → 所有已打开的文件对话框自动跳到同一个目录。
+> **本仓库已停止接收插件源码。**
+> 插件的源码与活跃开发已迁至 **Alpha File Manager** 仓库:
+> **<https://github.com/kizemo/alpha-file-manager>**
 
 ---
 
-## ⚠️ 仓库边界(先读这一段)
+## 1. 这里还剩什么
 
-本仓库 **只包含 Focus Sync 本身**,不包含 Sigma FM。
-
-| | 位置 | 说明 |
+| 内容 | 位置 | 说明 |
 |---|---|---|
-| **Focus Sync**(本仓库) | `sigma-listary-spike/` `release/extension/` `release/extension-installer/` | sidecar Rust 源码 + 插件本体 + NSIS 安装器 |
-| **Sigma FM fork** | [`github.com/kizemo/alpha-file-manager`](https://github.com/kizemo/alpha-file-manager) | 独立仓库,fork 自 [`aleksey-hoffman/sigma-file-manager`](https://github.com/aleksey-hoffman/sigma-file-manager)。本仓库通过 `.gitignore` 完全排除它 |
+| **已发布的独立安装包** | `release/kizemo.focus-sync-0.5.8-setup.exe` | v0.5.8,用户实测通过的那一版 |
+| **文档与交接记录** | `docs/` | 架构说明、变更史、历次 handoff |
+| **历史交接文件** | `handoff-*.md` / `prompt-*.md` | 失败记录也是记录,不要删 |
 
-**两者零源码耦合。** 本项目只通过 Sigma FM 的**公开扩展 API**(manifest / 沙箱 / 权限)与之交互。
-最直接的证据:沙箱规则由 [`scripts/scan-sandbox-dynamic.cjs`](scripts/scan-sandbox-dynamic.cjs)
-**在运行时从 fork 的 `sandbox.ts` 提取**,而不是把沙箱代码复制过来 —— fork 更新,门禁自动跟上。
+**源码不在这里了。** 插件的完整源码在品牌仓的
+[`extensions/kizemo.focus-sync/`](https://github.com/kizemo/alpha-file-manager):
 
-> 仓库曾名为 `filemanager`,但其中并无文件管理器。改名以消除误导。
+```
+extensions/kizemo.focus-sync/
+├── sidecar/      后台程序 Rust 源码
+├── dist/         插件主文件(手工维护,无构建链)
+├── locales/      语言包
+├── installer/    独立 NSIS 安装器 + PS 脚本
+└── package.json
+```
 
 ---
 
-## 架构
+## 2. 为什么要迁走
 
+原先插件在独立仓库、文件管理器在 fork 仓库,两者**互相知道对方的位置**:
+打包时要从隔壁目录取插件文件。结果是**单独克隆文件管理器仓构建不出带插件的安装包**,
+沙箱门禁也要跨仓读源码。README 里当时写的「两者零源码耦合」并不属实。
+
+2026-10-09 把插件源码并入品牌仓后,这个依赖**真正消失**了。
+
+**源码只有一份,是这次迁移唯一的硬要求。** 两处副本各自演化正是本项目历史上
+最大的一次故障(`sidecar 路径分裂`:两个安装器把同一个文件放在不同位置,
+互相覆盖计划任务、留下孤儿副本,使验收门禁永远不可能通过)。
+
+---
+
+## 3. 需要独立发版时怎么办
+
+```powershell
+# 1. 在品牌仓构建侧车并打包
+cd <品牌仓>
+cd extensions/kizemo.focus-sync/sidecar; cargo build --release
+cd ../../..; powershell -NoProfile -ExecutionPolicy Bypass -File scripts\build-with-sidecar.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File extensions\kizemo.focus-sync\installer\build.ps1
+
+# 2. 把产出的安装包复制到本仓 release/ 存档
 ```
-┌─────────────────────────────┐
-│  Sigma FM (独立仓库,fork)   │
-│  └─ extension worker        │
-│      kizemo.focus-sync       │
-└───────────┬─────────────────┘
-            │ ① onPathChange 事件
-            │ ② POST /set_path
-            ▼
-┌─────────────────────────────┐
-│  sidecar (Rust, 127.0.0.1:37421)
-│  ├─ HTTP server  收路径      │
-│  ├─ UIA monitor  只认前台对话框│
-│  └─ writer      注入对话框    │
-└─────────────────────────────┘
-            │ ③ UIA / SendInput
-            ▼
-   Save As / 下载弹窗(地址栏)
-```
 
-### 为什么需要 sidecar
+**不要**在本仓恢复任何插件源码。两处副本必然漂移。
 
-Sigma FM 的 extension 跑在 **Web Worker** 里,拿不到桌面窗口句柄,无法驱动
-其他进程的文件对话框。需要一个同会话的本地进程做 UIA 注入。
+---
 
-sidecar 由 **Windows 计划任务 `KizemoFocusSync`** 启动(登录时),与 Sigma FM 生命周期解耦。
+## 4. 许可证与源码获取义务(GPL-3 §6)
 
-### 关键设计约束
+本仓历史上以 MIT 分发插件。插件源码迁入 **GPL-3.0-or-later** 的品牌仓后,
+随二进制分发的组件整体按 GPL-3 条款分发。
 
-| 约束 | 原因 |
+分发二进制时必须同时提供对应源码,获取方式:
+
+| 组件 | 源码位置 |
 |---|---|
-| **绝不抢焦点** | 用户在 Sigma FM 操作时,sidecar 不得把焦点切回对话框。前台状态由 monitor 线程(有 Windows 消息泵)发布到共享 `AppState`,HTTP 线程**不自行查询** `GetForegroundWindow()`(无消息泵时返回值不可靠) |
-| **非前台对话框只延后,不写入** | 用户手动切回对话框时才同步 |
-| **地址栏而非文件名框** | 往文件名框写路径只是污染,不是导航。WinUI 3 / Chromium 对话框**没有可 SetValue 的地址栏元素**,只能用 `Ctrl+L` |
-| **两道护栏** | ① 文件名框读回比对 ② `GetGUIThreadInfo` 实时焦点检查。任一不通过就**拒绝按 Enter**,失败方向是「不生效」而非「误保存」 |
+| **Focus Sync 插件 + sidecar** | <https://github.com/kizemo/alpha-file-manager> → `extensions/kizemo.focus-sync/` |
+| Alpha File Manager 本体 | <https://github.com/kizemo/alpha-file-manager> |
+| Sigma File Manager(上游基座) | <https://github.com/aleksey-hoffman/sigma-file-manager> |
 
 ---
 
-## 组件
+## 5. 这个插件是干什么的
 
-| 组件 | 位置 | 规模 | 说明 |
-|---|---|---|---|
-| sidecar | `sigma-listary-spike/` | 13 文件 / ~3.9k 行 Rust | crate `sigma-listary-spike`,产物名 `spike` |
-| **插件** | **`release/extension/dist/index.js`** | ~726 行 JS | ESM,`onStartup` 激活。**唯一真相源,手工维护** |
-| 安装器 | `release/extension-installer/` | NSIS + 10 个 PS 脚本 | 计划任务的建/删 |
-| 工具链 | `scripts/` | 5 个脚本 | 沙箱扫描 + 日志读取 |
+你在文件管理器里切换目录 → 所有已打开的文件对话框自动跳到同一个目录。
+Save As / 下载弹窗的地址栏会跟随。
 
-> ### ⚠️ 插件没有 TypeScript 构建链 —— 这是有意的
->
-> 仓库曾有一个 `extension/` 目录,里面是 **pre-v0.3.0 的 spawn 架构**
-> (用 `sigma.binary` 亲自拉起 sidecar)。而插件实际用的是 **Scheduled Task 架构**(v0.5.5)。
-> **两者不是新旧版本,是两条设计路线。**
->
-> 用它构建会覆盖 `dist/index.js`,丢掉 v0.3.0 → v0.5.5 的全部修复
-> (sandbox 门禁、焦点归属、有护栏的地址栏导航)。
-> 该目录已于 2026-10-08 **删除**,以杜绝误用。
->
-> 恢复 TypeScript 构建链是一项独立工程:需要先把 `dist/index.js` 反向整理成
-> 等价的 TypeScript,再让 rollup 接管。**在此之前,手工维护 `dist` 是唯一安全的选择。**
+架构:UIA 只认前台对话框,绝不抢焦点;sidecar 由 Windows 计划任务
+`KizemoFocusSync` 启动,与文件管理器生命周期解耦。
 
-### 改插件的唯一正确方式
-
-```bash
-# 1. 直接编辑 release/extension/dist/index.js
-# 2. 改完必须跑沙箱门禁
-node scripts\scan-sandbox-dynamic.cjs release\extension\dist\index.js
-#    期望:VALID (0 violations / 19 patterns)
-```
-
-### 插件权限(最小集)
-
-```json
-["commands", "toolbar", { "name": "http", "hosts": ["http://127.0.0.1:37421"] }, "notifications"]
-```
-
-只允许访问本机 sidecar,**无 `shell`、无 `fs`**。
-
----
-
-## 安装
-
-> ### ⚠️ 装完不能立刻测 —— 要先等它「热起来」
->
-> **症状**:刚装完 / 刚重启 Sigma FM 就打开下载或另存为弹窗,**地址栏不同步**;
-> 等 2–3 分钟(或在 Sigma FM 里切换一次目录)之后就正常了。**这是已知且可预期的行为,
-> 不是安装失败。**
->
-> **实测时间线**(2026-10-08 重新安装后):
->
-> ```
-> 21:50:46  Sigma FM 启动
-> 21:52:25  弹窗打开 → 21:52:26  写入被拒:extension_not_alive
-> 21:53:03  扩展激活完成          ← 距启动 2 分 17 秒
-> 21:53:48  Sigma FM 发出首个目录变化 → 开始正常同步
-> ```
->
-> **两个原因叠加**:
->
-> 1. **sidecar 的存活闸门**。60 秒内没收到扩展心跳就拒绝写入,防止 Sigma FM 关着时
->    把上次的旧路径灌进弹窗。扩展刚启动还没激活 → 心跳没来 → 拒绝。
-> 2. **扩展激活时拿不到当前目录**。`getCurrentPath()` 返回 `null`、历史路径也是空,
->    所以它必须等 Sigma FM 发出第一次目录变化通知,才知道该同步哪个路径。
->
-> **正确的测法**:装完 → 启动 Sigma FM → **等 3 分钟** → 在 Sigma FM 里**切换一次目录**
-> → 打开弹窗。
->
-> **判断是否真的坏了**(别只看「不同步」):
->
-> ```powershell
-> # extension_alive 必须为 true;age 应在 15 秒量级
-> (Invoke-RestMethod http://127.0.0.1:37421/health) | Select-Object extension_alive,last_health_poll_age_ms
-> ```
->
-> `extension_alive=false` → 还在冷启动,等;
-> `extension_alive=true` 但仍不同步 → 才是真问题,请查 `spike.log` 里的 `WriteFailed` 原因。
-
-### 方式一:NSIS 安装器(推荐)
-
-```powershell
-# 打包
-powershell -NoProfile -ExecutionPolicy Bypass -File release\extension-installer\build.ps1
-# 运行(交互模式,不要用 /S)
-release\extension-installer\kizemo.focus-sync-0.5.8-setup.exe
-# 验收 —— 退出码 0 才算通过,「装完了」不算
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts\verify-deploy-sha.ps1
-```
-
-安装器会:
-1. 复制插件到 `%APPDATA%\com.sigma-file-manager.app\extensions\kizemo.focus-sync\`
-2. 写 `user-extensions.json`(`isLocal: true`,防止被自动清理)
-3. 注册计划任务 `KizemoFocusSync`(AtLogOn / Interactive / Limited)
-4. 把 sidecar 装到**唯一规范路径**(与手动部署、register.ps1、验收门禁完全一致):
-
-```
-%APPDATA%\com.sigma-file-manager.app\extensions\kizemo.focus-sync\
-    bin\focus-sync-sidecar\focus-sync-sidecar.exe
-```
-
-> ⚠️ **整合进 Sigma FM 的大包也装到这个路径**(2026-10-08 起)。
-> 早前版本装在 `D:\Program Files\Sigma FM\tools\`,两套安装器因此互相覆盖计划任务、
-> 留下孤儿副本,并使验收门禁无法通过。现在只有一个规范路径。
-> 若你机器上还有 `D:\Program Files\Sigma FM\tools\focus-sync-sidecar.exe` 残留,
-> 装一次新版大包即可自动清理。
-
-**卸载时自动删除计划任务并清理孤儿进程。**
-
-> **装之前请先手动退出 Sigma FM。** 安装器虽然会自动尝试关闭它,
-> 但该调用在本机不生效;杀不掉时会**直接中止安装**并留下
-> `%TEMP%\focus-sync-install-FAILED.txt`,以免装出一个「注册丢失」的坏状态。
-
-### 方式二:手动部署(调试用)
-
-```powershell
-# 0. 先关掉 Sigma FM
-# 1. 构建并部署 sidecar 到规范路径
-.\sigma-file-manager\scripts\build-with-sidecar.ps1 -RepoRoot $PWD
-
-# 2. 复制插件文件
-Copy-Item release\extension\dist\index.js `
-  "$env:APPDATA\com.sigma-file-manager.app\extensions\kizemo.focus-sync\dist\index.js" -Force
-
-# 3. 注册计划任务
-.\release\extension-installer\register-scheduled-task.ps1 -SidecarPath <sidecar.exe>
-
-# 4. 卸载时
-.\release\extension-installer\unregister-scheduled-task.ps1
-```
-
-> **端口冲突陷阱**:换 sidecar 二进制前**必须先停掉正在运行的实例**。
-> 计划任务用 `--service`(fail-fast)模式,端口被占会直接启动失败。
-
----
-
-## 开发
-
-### 构建 sidecar
-
-```powershell
-$env:PATH = "C:\Users\Duanyi\.rustup\toolchains\1.85.0-x86_64-pc-windows-msvc\bin;$env:PATH"
-cd sigma-listary-spike
-cargo build --release
-```
-
-### 修改插件后必须跑沙箱门禁
-
-```powershell
-node scripts\scan-sandbox-dynamic.cjs release\extension\dist\index.js
-```
-
-**期望:`VALID (0 violations / 19 patterns)`**
-
-⚠️ **沙箱会扫描注释,不只扫描代码。** 一句 `foreground window.` 曾经导致 extension
-被静默拒绝、永不加载(sidecar 108 分钟 0 请求),且没有任何 UI 报错。
-
-规则从 `sandbox.ts` **实时提取**(不是硬编码快照)—— 该文件在 git 历史中变更过
-(`ba3e5a3f` 新增 `.constructor()`),硬编码会静默失效。
-
-**门禁已长在部署路径上:** 构建 / 部署 / 注册 / commit 四道 Hook 都会自动跑它。
-
----
-
-## 诊断工具
-
-出问题时的标准动作 —— **读持久化日志,不要只看 DevTools**。
-
-### 读 sidecar 日志
-
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts\read-sidecar-log.ps1
-```
-
-- 同时呈现 `spike.log`(JSONL 事件)与 `spike.log.YYYY-MM-DD`(tracing 原因)
-- **强制 UTF-8 解码**(sidecar 响应不带 charset,PowerShell 默认 ANSI 会造成假乱码)
-- 枚举当前存活的 `#32770` 对话框并与 `active_dialogs` 对比 → **一眼看出注册表里是不是死句柄**
-
-### 读插件 trace
-
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts\read-focus-trace.ps1
-```
-
-插件把节点级 trace(`N01`–`N15`)持久化到 `sigma.storage`,**跨重启保留**。
-编码判据存成**码元数值**而非字符串 —— 正在追查乱码 bug 时,乱码本身不能污染证据。
-
-### 日志位置
-
-```
-%LOCALAPPDATA%\kizemo\focus-sync\logs\spike.log              JSONL 事件
-%LOCALAPPDATA%\kizemo\focus-sync\logs\spike.log.YYYY-MM-DD   tracing 原因
-```
-
-> 只看第一个文件会**永远看不到失败的真实原因** —— 它在第二个文件里。
-
----
-
-## 已知限制
-
-| 项 | 影响 |
-|---|---|
-| **死 HWND 累积** | ✅ **已修复(v0.5.8)** —— 清理发生在 `http_server` 循环体的最前面,早于 DEDUP 与「非前台延后」两个 `continue`。第一版把检查放在注入入口,被那两个 `continue` 挡在前面,实测无效 |
-| **H2 假成功** | ✅ **已修复(v0.5.8)** —— H2 的还原现在必须**读回证明**完全等于原始文件名,否则返回失败而非谎报成功 |
-| **`getCurrentPath()` 返回 null** | ✅ **已修复(v0.5.8)** —— 工具栏「Sync Now」与启动读取都改为回落 `lastKnownPath` |
-| **推送链路未完全可观测** | ✅ **已修复(v0.5.8)** —— 根因是健康轮询把 300 条 trace 环冲满导致推送证据被覆盖。已止血并新增 `N18`/`N19` 推送节点 |
-| **G1 重复写入** | ✅ **已修复(v0.5.8)** —— 弹窗首次检测走 `should_push` 分支时未武装冷却,导致同一弹窗被写两遍 |
-| **G2 激活过渡导致「派发但没导航」** | ✅ **已修复(v0.5.8)** —— Windows 激活会经过 `ForegroundStaging` 临时窗口,采样撞上它会让 H1 被 BUG-1 闸门正确拦下、继而落到无效的 H2。改为**在闸门上等**(不放宽闸门) |
-| **G3 陈旧路径注入** | ✅ **已修复(v0.5.8)** —— Sigma FM 关闭或刚重启(扩展激活需约 1-2 分钟)时,sidecar 会把旧路径灌进弹窗。改为以插件专属端点 `GET /ext_alive` 的轮询作为存活门槛,超窗拒绝写入 |
-| `/health` 缺 `charset` | ✅ **已修复(v0.5.8)** —— 一行。缺它会让客户端退回系统 ANSI 代码页,把中文路径显示成乱码 |
-| **H1 键盘回退重复输入** | **开放(休眠中)** —— 源码里仍有两段相同的按键块。激活等待修复后实测 5/5 走 DIRECT-1,该路径暂时进不去;DIRECT-1 一旦失败就会回来 |
-| **扩展启动延迟约 1-2 分钟** | **开放** —— Sigma FM 自身加载扩展的耗时,现已可观测(日志有 `EXTENSION ALIVE`,`/health` 有 `extension_alive` 字段),但要缩短需先查明它为何慢 |
-| **WinUI 3 对话框** | 无法通过 COM `IFileDialog::SetFolder` 导航(结构性的,`SetFolder succeeded = 0`)。Edge 可用 `edge://flags/#edge-legacy-file-picker` 切回经典选择器 |
-
----
-
-## 文档
-
-| 文档 | 内容 |
-|---|---|
-| [`docs/extension-changelog.md`](docs/extension-changelog.md) | **v0.3.0 → v0.5.5 完整变更史 + 沙箱约束 + 部署契约** |
-| `docs/superpowers/plans/2026-10-08-focus-21-full-retrospective.md` | 完整复盘:18 小时排障的错误清单与方法论沉淀 |
-| `docs/superpowers/plans/` | 设计与实施计划存档 |
-
-> **变更历史不要写回 `index.js`** —— 注释同样会被沙箱扫描。它属于文档。
-
----
-
-## License
-
-MIT
+详见品牌仓 README 与本仓 `docs/`。
