@@ -106,24 +106,79 @@ node scripts\scan-sandbox-dynamic.cjs release\extension\dist\index.js
 
 ## 安装
 
+> ### ⚠️ 装完不能立刻测 —— 要先等它「热起来」
+>
+> **症状**:刚装完 / 刚重启 Sigma FM 就打开下载或另存为弹窗,**地址栏不同步**;
+> 等 2–3 分钟(或在 Sigma FM 里切换一次目录)之后就正常了。**这是已知且可预期的行为,
+> 不是安装失败。**
+>
+> **实测时间线**(2026-10-08 重新安装后):
+>
+> ```
+> 21:50:46  Sigma FM 启动
+> 21:52:25  弹窗打开 → 21:52:26  写入被拒:extension_not_alive
+> 21:53:03  扩展激活完成          ← 距启动 2 分 17 秒
+> 21:53:48  Sigma FM 发出首个目录变化 → 开始正常同步
+> ```
+>
+> **两个原因叠加**:
+>
+> 1. **sidecar 的存活闸门**。60 秒内没收到扩展心跳就拒绝写入,防止 Sigma FM 关着时
+>    把上次的旧路径灌进弹窗。扩展刚启动还没激活 → 心跳没来 → 拒绝。
+> 2. **扩展激活时拿不到当前目录**。`getCurrentPath()` 返回 `null`、历史路径也是空,
+>    所以它必须等 Sigma FM 发出第一次目录变化通知,才知道该同步哪个路径。
+>
+> **正确的测法**:装完 → 启动 Sigma FM → **等 3 分钟** → 在 Sigma FM 里**切换一次目录**
+> → 打开弹窗。
+>
+> **判断是否真的坏了**(别只看「不同步」):
+>
+> ```powershell
+> # extension_alive 必须为 true;age 应在 15 秒量级
+> (Invoke-RestMethod http://127.0.0.1:37421/health) | Select-Object extension_alive,last_health_poll_age_ms
+> ```
+>
+> `extension_alive=false` → 还在冷启动,等;
+> `extension_alive=true` 但仍不同步 → 才是真问题,请查 `spike.log` 里的 `WriteFailed` 原因。
+
 ### 方式一:NSIS 安装器(推荐)
 
 ```powershell
-release\extension-installer\build.ps1        # 打包
-# 运行 kizemo.focus-sync-0.2.0-setup.exe
+# 打包
+powershell -NoProfile -ExecutionPolicy Bypass -File release\extension-installer\build.ps1
+# 运行(交互模式,不要用 /S)
+release\extension-installer\kizemo.focus-sync-0.5.8-setup.exe
+# 验收 —— 退出码 0 才算通过,「装完了」不算
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\verify-deploy-sha.ps1
 ```
 
 安装器会:
 1. 复制插件到 `%APPDATA%\com.sigma-file-manager.app\extensions\kizemo.focus-sync\`
 2. 写 `user-extensions.json`(`isLocal: true`,防止被自动清理)
 3. 注册计划任务 `KizemoFocusSync`(AtLogOn / Interactive / Limited)
-4. 把 sidecar 装到规范路径
+4. 把 sidecar 装到**唯一规范路径**(与手动部署、register.ps1、验收门禁完全一致):
+
+```
+%APPDATA%\com.sigma-file-manager.app\extensions\kizemo.focus-sync\
+    bin\focus-sync-sidecar\focus-sync-sidecar.exe
+```
+
+> ⚠️ **整合进 Sigma FM 的大包也装到这个路径**(2026-10-08 起)。
+> 早前版本装在 `D:\Program Files\Sigma FM\tools\`,两套安装器因此互相覆盖计划任务、
+> 留下孤儿副本,并使验收门禁无法通过。现在只有一个规范路径。
+> 若你机器上还有 `D:\Program Files\Sigma FM\tools\focus-sync-sidecar.exe` 残留,
+> 装一次新版大包即可自动清理。
 
 **卸载时自动删除计划任务并清理孤儿进程。**
+
+> **装之前请先手动退出 Sigma FM。** 安装器虽然会自动尝试关闭它,
+> 但该调用在本机不生效;杀不掉时会**直接中止安装**并留下
+> `%TEMP%\focus-sync-install-FAILED.txt`,以免装出一个「注册丢失」的坏状态。
 
 ### 方式二:手动部署(调试用)
 
 ```powershell
+# 0. 先关掉 Sigma FM
 # 1. 构建并部署 sidecar 到规范路径
 .\sigma-file-manager\scripts\build-with-sidecar.ps1 -RepoRoot $PWD
 

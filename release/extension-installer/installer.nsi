@@ -1,5 +1,5 @@
 ﻿; ============================================================================
-; kizemo.focus-sync 0.2.0 — Standalone NSIS Installer
+; kizemo.focus-sync 0.5.8 — Standalone NSIS Installer
 ; ============================================================================
 ; This installer is a one-click solution to register the Focus Sync extension
 ; with Sigma File Manager. It:
@@ -29,14 +29,20 @@ SetCompressor /FINAL /SOLID lzma
 ; Metadata
 ; ---------------------------------------------------------------------------
 !define PRODUCT_NAME      "Focus Sync Extension"
-!define PRODUCT_VERSION   "0.2.0"
+!define PRODUCT_VERSION   "0.5.8"
 !define PRODUCT_PUBLISHER  "kizemo"
 !define PRODUCT_ID         "kizemo.focus-sync"
 !define PRODUCT_EXTDIR     "kizemo.focus-sync"
 !define PRODUCT_SIDECAR    "focus-sync-sidecar"
-!define PRODUCT_SIDECAR_VER "0.2.0"
+!define PRODUCT_SIDECAR_VER "0.5.8"
 !define SIGMA_APP_DIR      "com.sigma-file-manager.app"
 !define SIGMA_USERDATA     "$APPDATA\${SIGMA_APP_DIR}"
+
+; Canonical sidecar location. This single constant is the reason the deploy
+; sha gate can pass: manual-install.ps1 ($binDir), register.ps1's canonical
+; probe and the KizemoFocusSync task must all agree with it.
+!define SIDECAR_DEST_DIR  "${SIGMA_USERDATA}\extensions\${PRODUCT_EXTDIR}\bin\${PRODUCT_SIDECAR}"
+!define SIDECAR_DEST_PATH "${SIDECAR_DEST_DIR}\${PRODUCT_SIDECAR}.exe"
 
 ; ---------------------------------------------------------------------------
 ; Custom vars (must be declared before first use)
@@ -71,36 +77,12 @@ BrandingText "${PRODUCT_NAME} ${PRODUCT_VERSION}"
 !insertmacro MUI_LANGUAGE "SimpChinese"
 
 ; ---------------------------------------------------------------------------
-; Helper: detect if Sigma FM is running. Sets $0 to "running" or "stopped".
+; NOTE (2026-10-08): CheckSigmaFMRunning / KillSigmaFM / ReopenSigmaFM were
+; NSIS Functions wrapping nsExec, invoked with "Call". Observed: they never
+; executed -- an install finished in 10s while kill-sigma.ps1 needs >=12s.
+; All three are now inlined at their call sites (Stages 1 and 8), which is the
+; form that Stage 5 has always used successfully.
 ; ---------------------------------------------------------------------------
-Function CheckSigmaFMRunning
-    ; Use $$p so NSIS preprocessor doesn't substitute it (literal $p for PowerShell).
-    nsExec::ExecToLog 'powershell -NoProfile -Command "$$p = Get-Process -Name sigma-file-manager -ErrorAction SilentlyContinue; if ($$p) { exit 0 } else { exit 1 }"'
-    Pop $0
-    ; $0 is exit code: 0 = running, 1 = stopped
-    StrCmp $0 "0" 0 +2
-        StrCpy $0 "running"
-        Goto +2
-        StrCpy $0 "stopped"
-FunctionEnd
-
-; ---------------------------------------------------------------------------
-; Helper: kill Sigma FM gracefully via kill-sigma.ps1 in $PLUGINSDIR.
-; Returns $0 = 0 on success (clean exit OR force-kill), 1 on hard failure.
-; ---------------------------------------------------------------------------
-Function KillSigmaFM
-    nsExec::ExecToLog 'powershell -NoProfile -ExecutionPolicy Bypass -File "$PLUGINSDIR\kill-sigma.ps1"'
-    Pop $0
-FunctionEnd
-
-; ---------------------------------------------------------------------------
-; Helper: re-launch Sigma FM via reopen-sigma.ps1 in $PLUGINSDIR.
-; Returns $0 = 0 on success, 1 if binary not found / failed to start.
-; ---------------------------------------------------------------------------
-Function ReopenSigmaFM
-    nsExec::ExecToLog 'powershell -NoProfile -ExecutionPolicy Bypass -File "$PLUGINSDIR\reopen-sigma.ps1"'
-    Pop $0
-FunctionEnd
 
 ; ---------------------------------------------------------------------------
 ; Installation
@@ -110,9 +92,11 @@ Section "Install Focus Sync Extension" SecInstall
 
     DetailPrint "==> [Focus Sync Installer] v0.3.0 (Scheduled Task mode) BEGIN"
 
-    ; ---- Stage 0: Stage PowerShell helpers in $PLUGINSDIR (NSIS temp) ----
-    DetailPrint "==> Stage 0: Preparing helper scripts in $PLUGINSDIR..."
-    SetOutPath $PLUGINSDIR
+    ; ---- Stage 0: Stage the PowerShell helpers ----
+    ; They go to $INSTDIR\bin, NOT $PLUGINSDIR: $PLUGINSDIR expands to an empty
+    ; string here, which silently broke the Sigma FM kill (see Stage 1).
+    DetailPrint "==> Stage 0: Preparing helper scripts in $INSTDIR\bin..."
+    SetOutPath "$INSTDIR\bin"
     File "kill-sigma.ps1"
     File "reopen-sigma.ps1"
 
@@ -125,27 +109,76 @@ Section "Install Focus Sync Extension" SecInstall
     ; over the manual-close popup.
     StrCpy $SIGMAWASRUNNING "0"
     DetailPrint "==> Stage 1: Checking if Sigma FM is running..."
-    Call CheckSigmaFMRunning
-    ${If} $0 == "running"
-        DetailPrint "==> Sigma FM is running. Sending WM_CLOSE + waiting for graceful exit..."
-        Call KillSigmaFM
+    ; ROOT CAUSE of the "auto-close never worked" bug (2026-10-08):
+    ; the helper scripts were staged into $PLUGINSDIR and invoked as
+    ;   powershell ... -File "$PLUGINSDIR\kill-sigma.ps1"
+    ; but $PLUGINSDIR expands to an EMPTY string at that point, so the command
+    ; actually ran as  -File "\kill-sigma.ps1"  and failed. Proven with an
+    ; isolated NSIS harness: $PLUGINSDIR printed as "[]" while two control
+    ; probes proved nsExec itself returns exit codes correctly (7 and 3).
+    ; The scripts now live in $INSTDIR\bin, which is known-good -- that is the
+    ; same mechanism Stage 5's register.ps1 call has always used.
+    ;
+    ; The detection + kill also used to live in NSIS Functions invoked with
+    ; "Call", which never executed either. Everything is inline now.
+    nsExec::ExecToLog 'powershell -NoProfile -Command "$$p = Get-Process -Name sigma-file-manager -ErrorAction SilentlyContinue; if ($$p) { exit 0 } else { exit 1 }"'
+    Pop $0
+    ${If} $0 == "0"
+        ; ---- Ask the user before closing their app ----
+        DetailPrint "==> Sigma FM is running."
+        MessageBox MB_YESNO|MB_ICONQUESTION "检测到 Sigma File Manager 正在运行。$\r$\n$\r$\n安装需要先关闭它 —— 否则它会用内存里的旧状态覆盖插件注册信息,$\r$\n导致插件装上了却无法加载(无任何报错)。$\r$\n$\r$\n是否现在关闭 Sigma FM 并继续安装?$\r$\n$\r$\n选择「否」将取消本次安装。" /SD IDYES IDYES 0 IDNO 0
         Pop $0
-        ${If} $0 == "0"
-            DetailPrint "==> Sigma FM exited gracefully."
-        ${Else}
-            DetailPrint "==> WARNING: Sigma FM force-killed (did not respond to WM_CLOSE within 10s)."
+        ; Only an EXPLICIT "No" (IDNO = 7) cancels. Under /S the dialog is
+        ; suppressed and NSIS returns 0, which must NOT be read as a refusal --
+        ; otherwise unattended installs could never close a running app.
+        ; Safety is not weakened: the post-condition assertion below still
+        ; aborts if the app is still alive afterwards.
+        DetailPrint "    (prompt returned: $0)"
+        ${If} $0 == 7
+            DetailPrint "==> 用户选择不关闭 Sigma FM,安装已取消。"
+            Abort
         ${EndIf}
+
+        DetailPrint "==> 用户已确认。正在关闭 Sigma FM(先尝试正常退出,最多等 10 秒)..."
+        nsExec::ExecToLog 'powershell -NoProfile -ExecutionPolicy Bypass -File "$INSTDIR\bin\kill-sigma.ps1"'
+        Pop $0
         StrCpy $SIGMAWASRUNNING "1"
     ${Else}
         DetailPrint "==> Sigma FM is not running (good)."
     ${EndIf}
 
+    ; ---- Stage 1 post-condition: do not trust the kill, verify it ----
+    ; Sigma FM rewrites user-extensions.json from memory on its next save, so
+    ; installing while it is alive produces exactly the "installed but the
+    ; registration silently vanished" failure this project has hit before.
+    ; Assert the invariant instead of assuming it.
+    nsExec::ExecToLog 'powershell -NoProfile -Command "$$p = Get-Process -Name sigma-file-manager -ErrorAction SilentlyContinue; if ($$p) { exit 0 } else { exit 1 }"'
+    Pop $0
+    ${If} $0 == "0"
+        DetailPrint "==> ERROR: Sigma FM is STILL running after the kill attempt."
+        DetailPrint "    Continuing would let it overwrite user-extensions.json."
+        DetailPrint "    Close Sigma File Manager and run this installer again."
+        ; Silent mode (/S) prints to no console, so leave evidence on disk.
+        FileOpen $1 "$TEMP\focus-sync-install-FAILED.txt" a
+        FileWrite $1 "INSTALL ABORTED: Sigma FM (process 'sigma-file-manager') was still running after the Stage 1 kill attempt.$\r$\nIt would have overwritten user-extensions.json. Close it and re-run.$\r$\n"
+        FileClose $1
+        ; No MessageBox here on purpose: NSIS still opens the dialog under /S
+        ; and blocks forever with nobody there to click it. DetailPrint covers
+        ; interactive runs; the marker file covers silent ones.
+        DetailPrint "    Aborted. Marker written to %TEMP%\focus-sync-install-FAILED.txt"
+        Abort
+    ${EndIf}
+    DetailPrint "==> Verified: Sigma FM is not running."
+
     ; ---- Stage 1.5 (v0.3.0): Kill legacy v0.2.0 spawn-mode sidecar. ----
     ; v2 review V3.5: precise PowerShell path filter (NOT wildcard "*kizemo*").
     DetailPrint "==> Stage 1.5: Killing legacy v0.2.0 spawn-mode sidecar (precise path filter)..."
-    nsExec::ExecToLog 'powershell -NoProfile -Command "Get-Process focus-sync-sidecar -ErrorAction SilentlyContinue | Where-Object { $_.Path -like ''*\Sigma File Manager\tools\focus-sync-sidecar.exe'' -or $_.Path -like ''*\kizemo.focus-sync\bin\focus-sync-sidecar.exe'' } | Stop-Process -Force"'
+    ; "$$_" is required: NSIS expands a bare "$_" as an (empty) variable, which
+    ; turns the filter into the invalid "Where-Object { .Path -like ... }" and
+    ; makes this whole stage a silent no-op. Same escaping reason as "$$p" above.
+    nsExec::ExecToLog 'powershell -NoProfile -Command "Get-Process focus-sync-sidecar -ErrorAction SilentlyContinue | Where-Object { $$_.Path -like ''*\Sigma File Manager\tools\focus-sync-sidecar.exe'' -or $$_.Path -like ''*\kizemo.focus-sync\bin\focus-sync-sidecar.exe'' } | Stop-Process -Force"'
     Pop $0
-    ; Non-zero exit is fine
+    ; Non-zero exit is fine (no legacy sidecar is the normal case).
 
     ; ---- Stage 2: Create installer metadata dir ----
     DetailPrint "==> Stage 2: Creating installer metadata dir at $INSTDIR..."
@@ -154,15 +187,23 @@ Section "Install Focus Sync Extension" SecInstall
     File "unregister.ps1"
     File "README.md"
 
-    ; ---- Stage 2.5 (v0.3.0): Bundle PS scripts for Scheduled Task creation.
+    ; ---- Stage 2.5 (v0.3.0): Bundle PS scripts + deploy the sidecar ----
     ; v2 review S2: use NSIS `File` directive (NOT `!include` which is a
-    ; preprocessor directive). PS files go to $INSTDIR\bin\ alongside
-    ; the sidecar binary, so the install stage 9 below can invoke them
-    ; via PowerShell.
+    ; preprocessor directive). The PS scripts go to $INSTDIR\bin\ so the
+    ; uninstaller can find them again.
+    ;
+    ; 2026-10-08 FIX: the sidecar used to land in "$INSTDIR\bin\", i.e.
+    ; %LOCALAPPDATA%\Programs\kizemo.focus-sync\bin\. Nothing else ever
+    ; looked there -- manual-install.ps1, register.ps1's canonical probe and
+    ; the live KizemoFocusSync Scheduled Task all use the extension's own
+    ; bin\ dir. The result was a second, orphaned copy of the binary and a
+    ; deploy-sha gate that could never pass. One canonical location now.
     ; ----
     SetOutPath "$INSTDIR\bin"
     File "register-scheduled-task.ps1"
     File "unregister-scheduled-task.ps1"
+
+    SetOutPath "${SIDECAR_DEST_DIR}"
     File "..\extension\bin\focus-sync-sidecar.exe"
 
     ; ---- Stage 3: Copy extension files to %APPDATA% ----
@@ -179,8 +220,8 @@ Section "Install Focus Sync Extension" SecInstall
     File "..\extension\locales\zh-CN.json"
 
     ; ---- Stage 4 (v0.3.0): REMOVED — Sigma FM no longer spawns sidecar. ----
-    ; The sidecar binary lives at $INSTDIR\bin\focus-sync-sidecar.exe and is
-    ; launched by Windows Task Scheduler (stage 5 below), NOT by Sigma FM.
+    ; The sidecar binary lives at ${SIDECAR_DEST_PATH} and is launched by
+    ; Windows Task Scheduler (stage 6.5 below), NOT by Sigma FM.
 
     ; ---- Stage 5: Register in user-extensions.json via PowerShell ----
     DetailPrint "==> Stage 5: Registering extension in user-extensions.json..."
@@ -188,10 +229,10 @@ Section "Install Focus Sync Extension" SecInstall
 
     ; ---- Stage 6 (v0.3.0): Write registry key + register Scheduled Task ----
     DetailPrint "==> Stage 6: Writing SidecarPath registry key (HKCU\SOFTWARE\kizemo\focus-sync\)..."
-    WriteRegStr HKCU "SOFTWARE\kizemo\focus-sync" "SidecarPath" "$INSTDIR\bin\focus-sync-sidecar.exe"
+    WriteRegStr HKCU "SOFTWARE\kizemo\focus-sync" "SidecarPath" "${SIDECAR_DEST_PATH}"
 
     DetailPrint "==> Stage 6.5: Registering Scheduled Task 'KizemoFocusSync'..."
-    nsExec::ExecToLog 'powershell -NoProfile -ExecutionPolicy Bypass -File "$INSTDIR\bin\register-scheduled-task.ps1" -SidecarPath "$INSTDIR\bin\focus-sync-sidecar.exe"'
+    nsExec::ExecToLog 'powershell -NoProfile -ExecutionPolicy Bypass -File "$INSTDIR\bin\register-scheduled-task.ps1" -SidecarPath "${SIDECAR_DEST_PATH}"'
     Pop $0
     ${If} $0 != "0"
         DetailPrint "==> WARNING: register-scheduled-task.ps1 exited with code $0"
@@ -202,9 +243,10 @@ Section "Install Focus Sync Extension" SecInstall
     WriteUninstaller "$INSTDIR\uninst.exe"
 
     ; ---- Stage 8: Re-open Sigma FM if we killed it at Stage 1 ----
+    ; Same reason as Stage 1: inline nsExec, the Function form did not run.
     ${If} $SIGMAWASRUNNING == "1"
         DetailPrint "==> Stage 8: Re-opening Sigma File Manager..."
-        Call ReopenSigmaFM
+        nsExec::ExecToLog 'powershell -NoProfile -ExecutionPolicy Bypass -File "$INSTDIR\bin\reopen-sigma.ps1"'
         Pop $0
         ${If} $0 == "0"
             DetailPrint "==> Sigma FM re-opened."
@@ -216,7 +258,7 @@ Section "Install Focus Sync Extension" SecInstall
 
     DetailPrint "==> [Focus Sync Installer] END"
     DetailPrint "    Extension files:    ${SIGMA_USERDATA}\extensions\${PRODUCT_EXTDIR}"
-    DetailPrint "    Sidecar binary:     $INSTDIR\bin\focus-sync-sidecar.exe (perUser)"
+    DetailPrint "    Sidecar binary:     ${SIDECAR_DEST_PATH}"
     DetailPrint "    PS scripts:         $INSTDIR\bin\register-scheduled-task.ps1"
     DetailPrint "                        $INSTDIR\bin\unregister-scheduled-task.ps1"
     DetailPrint "    Registry:           HKCU\SOFTWARE\kizemo\focus-sync\SidecarPath"
@@ -234,7 +276,10 @@ Section "Uninstall"
     ; Remove extension files
     DetailPrint "==> Removing extension files..."
     RMDir /r "${SIGMA_USERDATA}\extensions\${PRODUCT_EXTDIR}"
-    ; Legacy cleanup: round 7 placed sidecar under binaries\ not extensions\<id>\bin\
+    ; Legacy cleanup: round 7 placed sidecar under binaries\ instead of
+    ; extensions\<id>\bin\ -- remove that older location too.
+    ; (No trailing backslash on a comment line: NSIS reads it as a line
+    ; continuation and silently swallows the RMDir below.)
     RMDir /r "${SIGMA_USERDATA}\binaries\${PRODUCT_SIDECAR}"
 
     ; Unregister from user-extensions.json

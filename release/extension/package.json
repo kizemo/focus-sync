@@ -1,7 +1,7 @@
 {
   "id": "kizemo.focus-sync",
   "name": "Focus Sync",
-  "version": "0.5.5",
+  "version": "0.5.8",
   "description": "Listary-style global focus sync. Sidecar runs as a Windows Scheduled Task (independent of Sigma FM lifecycle).",
   "publisher": {
     "name": "kizemo",
@@ -78,19 +78,5 @@
         ]
       }
     ]
-  },
-  "scripts": {
-    "build": "rollup -c rollup.config.mjs",
-    "typecheck": "tsc --noEmit",
-    "watch": "rollup -c rollup.config.mjs -w"
-  },
-  "devDependencies": {
-    "@rollup/plugin-node-resolve": "^15.2.3",
-    "@rollup/plugin-typescript": "^11.1.6",
-    "@sigma-file-manager/api": "^1.0.0",
-    "@types/node": "^20.11.0",
-    "rollup": "^4.18.0",
-    "tslib": "^2.6.3",
-    "typescript": "^5.4.0"
   }
 }

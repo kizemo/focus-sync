@@ -81,14 +81,21 @@ Copy-Item -Path (Join-Path $srcDir 'locales\en.json') -Destination (Join-Path $e
 Copy-Item -Path (Join-Path $srcDir 'locales\zh-CN.json') -Destination (Join-Path $extDir 'locales') -Force
 Copy-Item -Path (Join-Path $srcDir 'bin\focus-sync-sidecar.exe') -Destination $binDir -Force
 
-# Verify sidecar hash (must be round 19c)
-$expectedHash = '1297a6304df46bc7fd78c95faa2bd528fc1e04d991c1a1a5fb55376ed2f0be65'
-$actualHash = (Get-FileHash -Path (Join-Path $binDir 'focus-sync-sidecar.exe') -Algorithm SHA256).Hash
-if ($actualHash -ne $expectedHash) {
-    Write-Warning "Sidecar hash mismatch! Expected round 19c but got $actualHash"
-} else {
-    Write-Host "    Sidecar hash verified: round 19c."
+# Verify the deployed sidecar is byte-identical to the repo build output.
+# (Was: a hardcoded round-19c hash. The sidecar has been rebuilt many times
+#  since, so that comparison had been failing on every single run and printing
+#  a warning everyone learned to ignore -- a check that cannot pass is worse
+#  than no check. The real invariant is "copy == source", which is what the
+#  packaging acceptance gate (scripts\verify-deploy-sha.ps1) asserts too.)
+$srcSidecar = Join-Path $srcDir 'bin\focus-sync-sidecar.exe'
+$dstSidecar = Join-Path $binDir 'focus-sync-sidecar.exe'
+$srcHash = (Get-FileHash -Path $srcSidecar -Algorithm SHA256).Hash
+$dstHash = (Get-FileHash -Path $dstSidecar -Algorithm SHA256).Hash
+if ($srcHash -ne $dstHash) {
+    Write-Error "Sidecar copy mismatch! src=$srcHash dst=$dstHash"
+    exit 1
 }
+Write-Host "    Sidecar sha verified against repo build: $($srcHash.Substring(0,16))..."
 
 # ---- 3. Register in user-extensions.json ----
 Write-Host ""

@@ -553,8 +553,29 @@ fn try_send_path_via_sendinput(
         // thread, and their answers disagreed with the monitor's. That
         // disagreement is what produced `current=HWND(0x0)` in the SendInput
         // warn line and deferred every /set_path (2026-10-07 16:39).
-        let current_fg = state.foreground_dialog();
-        if current_fg != dialog_hwnd {
+        // v0.5.9 (2026-10-09) — G2 follow-up, root cause of "切回弹窗后不再同步".
+        //
+        // This was a BARE check: it sampled the monitor's foreground ONCE and
+        // returned immediately. Windows routes a window activation through a
+        // transient `ForegroundStaging` window, so a write triggered by the
+        // monitor's "dialog regained foreground -> resync" lands right inside
+        // that ~150ms transition and `fg` reads 0.
+        //
+        // Consequence: H1 bailed HERE, before ever reaching any of the five
+        // `await_dialog_foreground` gates further down -- which is why that
+        // function shows zero calls in the entire log history. Control fell
+        // through to H2, which writes the FILENAME box and restores it (that
+        // is not navigation, Claude Rule 58), and then logged
+        // "Injection succeeded". The user saw the address bar never change.
+        //
+        // Measured 2026-10-08 23:26:37 (hwnd=135358): fg=0 at this check ->
+        // H1 aborted -> H2 "succeeded" -> no navigation.
+        //
+        // The safety intent is UNCHANGED: we still never take foreground, never
+        // send anything, and still refuse outright if the dialog has not come
+        // forward. We only wait for the user to actually bring it forward.
+        if !await_dialog_foreground(state, dialog_hwnd, ACTIVATION_WAIT_MS) {
+            let current_fg = state.foreground_dialog();
             warn!(
                 "v0.5.7 H1: dialog hwnd={dialog_hwnd} is not foreground \
                  (monitor-published fg={current_fg}); NOT stealing focus, \

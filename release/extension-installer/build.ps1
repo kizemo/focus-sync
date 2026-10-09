@@ -11,7 +11,7 @@ $ErrorActionPreference = 'Stop'
 $nsisDir = 'C:\Program Files (x86)\NSIS'
 $makensis = Join-Path $nsisDir 'makensis.exe'
 $installerNsi = Join-Path $PSScriptRoot 'installer.nsi'
-$outExe = Join-Path $PSScriptRoot 'kizemo.focus-sync-0.2.0-setup.exe'
+$outExe = Join-Path $PSScriptRoot 'kizemo.focus-sync-0.5.8-setup.exe'
 
 if (-not (Test-Path $makensis)) {
     Write-Error "makensis.exe not found at $makensis. Adjust `$nsisDir in build.ps1."
@@ -39,7 +39,7 @@ $size = (Get-Item $outExe).Length
 Write-Host "==> Built: $outExe ($size bytes)"
 
 # Also copy to release/ top-level for easy access
-$topLevel = Join-Path (Join-Path $PSScriptRoot '..') 'kizemo.focus-sync-0.2.0-setup.exe'
+$topLevel = Join-Path (Join-Path $PSScriptRoot '..') 'kizemo.focus-sync-0.5.8-setup.exe'
 Copy-Item $outExe $topLevel -Force
 Write-Host "==> Copied to: $topLevel"
 exit 0
