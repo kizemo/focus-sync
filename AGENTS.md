@@ -84,6 +84,38 @@
 - **门禁红了先分清「真红」还是「超时」**（2026-10-22）：`single-instance-guard.test.ts` 的两条用例红了，但报错是 `Test timed out in 30000ms` 而不是断言失败 —— 根因是守卫脚本要**枚举全机进程**（WMI），机器上有 431 个进程时一次 `Get-CimInstance Win32_Process` 要 6.5 秒，用例跑完 42.5 秒 > vitest 的 30 秒默认超时，脚本本身其实全部通过。**断言失败才有内容可看；超时是另一回事。**
 - **`.ps1` 里也不能有中文**（2026-10-22，和 `.cmd` 同理）：PowerShell 5.1 按 ANSI 读无 BOM 文件，`.ps1` 里的中文正则会把解析器搞崩（报 `Unexpected token` + 字符串终止符丢失）。中文一律**作命令行参数**传入（命令行能正确带 Unicode）。`.ps1` 同理必须纯 ASCII。
 - **`SendInput` 的 Ctrl+V 要用正确的 VK 码**（2026-10-22）：VK_LCONTROL=0x11、**VK_V=0x56**。写成 `0x10`（那是 VK_SHIFT）发出去的是 Ctrl+Shift，字段一直空着，看起来像产品 bug。粘贴前还要先 **Ctrl+A 全选**，否则是**追加**而不是替换。
+- **注入的 Shift 到不了 webview 的 `shiftKey`（2026-10-22，Edge 隔离复现，与 Tauri 无关）**：
+  用 Edge 打开一个本地按键日志页（`.superpowers/sdd/probe-shift-in-edge.ps1` + `key-probe-server.cjs`）实测：
+  `Shift+Delete` / `Shift+ArrowDown` 到达页面时 `shiftKey=false`，而 `Ctrl+Shift+F` 正常（`shift=true ctrl=true`）。
+  形态是**修饰键的 keyup 抢在主键 keydown 之前到达**。
+  后果：应用里 `Shift+Delete` 变成**「移至垃圾箱」**而不是「从驱动器中删除」—— 看着像产品 bug，其实是注入缺陷。
+  ⚠️ **以下四条都试过，全都不解决问题，别再试**：① `VK_SHIFT 0x10` → `VK_LSHIFT 0xA0`；② 改用扫描码（`KEYEVENTF_SCANCODE`，shift=0x2A、del=0x53）；③ 把整个组合塞进**一次** `SendInput` 调用；④ 每次一个事件 + `Start-Sleep 60ms`。
+  **验收永久删除不要依赖键盘**，改走右键菜单顶部图标条里的垃圾桶（见下条）。字母键的 `Ctrl+Shift` 组合是可靠的，只有「单修饰键 + 非字母主键」会丢修饰键。
+- **永久删除的入口不在工具栏里，在文件条目右键菜单顶部的图标条里**（2026-10-22 实测，**上一轮写的「工具栏的垃圾桶下拉」是错的**）：
+  `file-browser-actions-menu.vue` 全仓只被 `dir-entry-context-menu.vue` 引用 —— 也就是**右键菜单**，没有第二处。
+  它的 quick-actions 区（`display:flex`）是菜单**顶部**的一排**纯图标按钮**：实测 5 个**可访问名为空**的 `Button`
+  （屏幕坐标 x=2124/2178/2232/2286/2340, y=261, 各 48×42），依次是 铅笔(重命名) / 复制 / 粘贴 / 链接 / **垃圾桶**。
+  垃圾桶点开是 Radix `DropdownMenu`：两项「移至垃圾箱 Del」与「**从驱动器中删除 Shift+Del**」。
+  ⚠️ **三个坑**：① 图标按钮**没有可访问名**，UIA 取元素时**不能只取有名字的**（否则永远找不到它）；
+  ② 下拉项的**可访问名带快捷键**（`从驱动器中删除 Shift+Del`），要按**子串**匹配，按等值匹配找不到；
+  ③ 永久删除确认框的按钮名也是「**删除**」（`dialogs.deleteIrreversibly.delete`），与下拉项文字**同名** —— 必须靠 ControlType 区分（`MenuItem` vs `Button`）。
+- **右键菜单作用于「光标下的那一个条目」**（2026-10-22）：`dir-entry-interactive.vue` 里是 `:entries="[dirEntry]"`。
+  ⇒ 想一次删掉一整棵树，靶子必须**挂在一个顶层条目下面**（`…\target\d000..d019\…`），
+  右键那个 `target` 才是入口。**没有多选入口**（`Ctrl+A` 选完再右键，右键菜单里也只有那一个）。
+  ⇒ 条目总数口径随之变：`directories` = 子目录数 **+1**（顶层目录自己），所以 `20 × 500` 的靶子是 **10,021** 项，不是 10,020。
+- **量进程线程数当并行证据时，基线必须在触发动作之前取**（2026-10-22）：触发用的辅助脚本自己会 sleep 2 秒，
+  事后取基线会把**已经开始干活的 worker 线程**算进基线里，于是「峰值 == 基线」看起来像「没有并行」。
+  正确量法：删除前 71 → 删除中峰值 75（正好 +4，对上 `MAX_PARALLEL_WORKERS = 4`）。
+- **PowerShell 里 `[System.IO.Directory]::EnumerateFiles(...).Count` 不会真的枚举**（2026-10-22）：
+  惰性 IEnumerable 上的 `.Count` 拿到的是**扩展方法**而不是元素数，要包一层 `@(...)`。
+  不包的后果是计数恒为 -1，验收脚本会一路等到超时才退出。
+- **应用启动后会弹「新功能」更新日志模态框，把整个文件列表挡住**（2026-10-22）：UIA 树里此时只有更新日志的内容，**一个文件卡片都找不到**。验收脚本必须先关掉它（关闭按钮名「关闭」= U+5173 U+95ED），否则「找不到卡片」会被误判成页面没加载。
+- **应用日志文件被应用独占锁着**（2026-10-22）：应用运行时 `[System.IO.File]::ReadAllText($appLog)` 抛「文件正由另一进程使用」。必须用
+  `File.Open($p, 'Open', 'Read', 'FileShare.ReadWrite')` + `StreamReader` 读。日志时间戳是 **UTC**（比本地少 8 小时）。
+- **`publish-bundle-to-release.mjs` 会遍历 `bundle/nsis/` 下所有历史安装包**，逐个 `rmSync` + 复制到 `release/`。只要 `release/` 里**任何一个**旧包被别的进程锁住（实测 3.4.0 被锁），整步就 exit 1 —— 而 `tauri build` 本身早已成功。
+  ⚠️ 打包后要**分清「构建失败」和「复制失败」**：新包用 `node -e "fs.copyFileSync(a,b)"` 单独补进 `release/` 即可，不必重跑整个打包。
+- **删除的条目总数要把「顶层路径本身」算进去**（2026-10-22）：`scan_paths` 对目录路径会 `entry.directories = 1`（把它自己算进去），再递归数子项。
+  所以「20 个目录 × 每目录 500 个文件」的靶子，条目总数是 **20 × 501 = 10,020**（不是 10,000）；终值 `deleted_items` 必须与 `total_items` **逐个相等**，不等就是有 bug。
 
 ## 3. 代码导航：graphify 知识图谱
 
