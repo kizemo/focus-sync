@@ -78,6 +78,12 @@
   绕法：给业务模块加 `*_blocking` 同步内核入口（见 `src-tauri/src/dir_reader.rs`、`src-tauri/src/global_search.rs`），调用方自己选执行器。
 - **`#[tool_router]` 不等于接线完成**（2026-10-16，rmcp）：只写 `#[tool_router] impl X {…}` 加自写的 `impl ServerHandler for X { fn get_info }`，编译通过、单测通过，**只有 `tools/list` 返回 `{"tools":[]}`**，一个工具都调不到。必须给 `impl ServerHandler` 加 `#[tool_handler]`。rustc 对 `tool_router` 字段报的 `never read` 警告在这里**不是误报**，是线索。
 - **验收时会有置顶的 Electron 窗口盖住应用**（2026-10-15）：遮挡守卫会正确地 `ABORT`，但 `ShowWindow(SW_MINIMIZE)` 对它无效（会自己弹回）。要把它 `MoveWindow` 到 `(-4000,-4000)`，并把原 rect 记进 `occluders.json` 以便收尾复原（`.superpowers/sdd/shift-occluders.ps1`）。
+- **`net use` 的盘符参数必须带冒号**（2026-10-22 真机踩到，代价是绕了半轮）：`net use Y \\host\share`（不带冒号）会被 `net.exe` 当成「连接名叫 Y 的远程资源」，报 **System error 67 —— 找不到网络名**；而 **67 恰好也是「共享根本不存在」的错误码**，两者一模一样，UNC 路径明明完全正确却一直像在「路径拼错」。`net use Y: \\host\share` 才是映射盘符。**凡是拼 `net use` 命令行，盘符一律带冒号。**
+- **`net.exe` 的输出是控制台代码页，不是 UTF-8**（2026-10-22）：中文 Windows 上是 cp936，按 UTF-8 解得到的是一串替换字符（用户看到「net use failed: ████████67██」，完全读不出原因）。要用 `MultiByteToWideChar` + `GetConsoleOutputCP` 按代码页解（`kernel32` 直接 `extern` 声明即可，零新增依赖）。
+- **`PrintWindow` 会返回陈旧帧**（2026-10-22 实测）：进度事件把 WebView2 渲染线程刷爆时，`PrintWindow(hwnd, hdc, 2)` 拿到的还是上一帧 —— 实测两次**不同**的运行都画出「file-00354.dat」。**判后台任务的运行状态要看文件系统（文件数是否停止增长），不要看屏幕。**
+- **门禁红了先分清「真红」还是「超时」**（2026-10-22）：`single-instance-guard.test.ts` 的两条用例红了，但报错是 `Test timed out in 30000ms` 而不是断言失败 —— 根因是守卫脚本要**枚举全机进程**（WMI），机器上有 431 个进程时一次 `Get-CimInstance Win32_Process` 要 6.5 秒，用例跑完 42.5 秒 > vitest 的 30 秒默认超时，脚本本身其实全部通过。**断言失败才有内容可看；超时是另一回事。**
+- **`.ps1` 里也不能有中文**（2026-10-22，和 `.cmd` 同理）：PowerShell 5.1 按 ANSI 读无 BOM 文件，`.ps1` 里的中文正则会把解析器搞崩（报 `Unexpected token` + 字符串终止符丢失）。中文一律**作命令行参数**传入（命令行能正确带 Unicode）。`.ps1` 同理必须纯 ASCII。
+- **`SendInput` 的 Ctrl+V 要用正确的 VK 码**（2026-10-22）：VK_LCONTROL=0x11、**VK_V=0x56**。写成 `0x10`（那是 VK_SHIFT）发出去的是 Ctrl+Shift，字段一直空着，看起来像产品 bug。粘贴前还要先 **Ctrl+A 全选**，否则是**追加**而不是替换。
 
 ## 3. 代码导航：graphify 知识图谱
 
