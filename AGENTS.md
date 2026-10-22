@@ -117,6 +117,33 @@
 - **删除的条目总数要把「顶层路径本身」算进去**（2026-10-22）：`scan_paths` 对目录路径会 `entry.directories = 1`（把它自己算进去），再递归数子项。
   所以「20 个目录 × 每目录 500 个文件」的靶子，条目总数是 **20 × 501 = 10,020**（不是 10,000）；终值 `deleted_items` 必须与 `total_items` **逐个相等**，不等就是有 bug。
 
+### 2.1 「比较并同步」的验收与清理（2026-10-22 新增）
+
+- **比较太快时抓不到进度指示**（2026-10-22）：默认准则（时间 + 大小）下 10 万条目/侧整轮只要 **354 ms**，
+  UIA 轮询根本来不及看到进度条。要取证**必须打开「按内容校验和」准则**，耗时才会拉到 **18 s**。
+  ⇒ 「没抓到进度条」这时**不能**判成「进度条没实现」。
+- **Radix 对话框在 UIA 里是 `[Window]`**，可访问名＝标题（「比较并同步」）。
+  **必须把元素搜索限定在这个子树内**：不限定时位置启发式会点到对话框标题栏的**关闭按钮**，
+  点完对话框消失，后续找不到「比较」按钮，症状是「脚本说找不到比较按钮」。
+- **比较对话框的两个路径输入框可访问名＝label 文本**（「左侧目录」/「右侧目录」），有 ValuePattern 可读回。
+  ⚠️ **粘贴前必须先 Ctrl+A**（输入框有初始值，否则是**追加**而不是替换）；粘贴后按 `END` 抑制内联补全；
+  **读回值必须等于期望**才算填对。
+- **「按内容校验和」这个 Radix Switch 没有可访问名**，靠「同一行右侧的小控件」定位（实测点击位置约 `(1886,694)`）。
+- **compare 模块此前一行日志都没有**（整份应用日志只有 `drag_no_activate` 的噪音）。
+  ⇒ 「查日志没查到错误」当时只能证明「后端没埋点」，**不能**证明「没出错」。
+  要拿错误文本只能**造出现场复现**。本轮已补埋点（`compare started/collected/finished` + 跳过 WARN）。
+- **验收靶子的清理**（本项目在用户家目录会堆几十万文件）：
+  - `rm --` 会被安全层拦（提示 `requires the targets-only trash marker`），
+    改用运行时的可恢复删除器：`<activeDataDir>\bin\mavis-trash.cmd -- "<路径>"`（接受 `-r` / `-f` 等 rm 风格参数）。
+  - ⚠️ **20 万文件的大树用这个 wrapper 会报 `failed to trash`**，但**直接调底层 API 是成功的** ——
+    真实错误被 CLIXML 吞掉，wrapper 的报错**不可信**。兜底写法：
+    ```powershell
+    Add-Type -AssemblyName Microsoft.VisualBasic
+    [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteDirectory($p,'OnlyErrorDialogs','SendToRecycleBin')
+    ```
+  - **`icacls /deny` 造出来的拒绝访问目录，删除前必须先 `icacls <dir> /remove:d Duanyi`**，否则删不掉。
+  - 清理完**核对「家目录里剩 0 个 + 回收站里 7 个都在」**，才算真清干净。
+
 ## 3. 代码导航：graphify 知识图谱
 
 本项目的**内层仓库** `sigma-file-manager/` 已建好本地 AST 知识图谱（2026-10-21 部署）：**零 LLM、零 API 成本、纯本地**，产物在 `sigma-file-manager/graphify-out/`（已加进 `.gitignore`，不进版本库）。
