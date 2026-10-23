@@ -144,6 +144,32 @@
   - **`icacls /deny` 造出来的拒绝访问目录，删除前必须先 `icacls <dir> /remove:d Duanyi`**，否则删不掉。
   - 清理完**核对「家目录里剩 0 个 + 回收站里 7 个都在」**，才算真清干净。
 
+### 2.2 与 upstream 的同步（2026-10-23 实测）
+
+- **AFM 与 upstream 已深度分叉**：merge base 是 `fed49cee`（2026-08-27）。AFM 领先 **251** 个 commit，upstream 领先 **23** 个。
+- **别用 GitHub compare 页的「148 个文件」判断差距** —— upstream 改的 148 个文件里 **89 个 AFM 也改过**（真冲突面），只有 59 个是 AFM 干净的。
+- **AFM 历史上做过两轮上游移植**（`86cf58ee` A 类「扩展安全加固」、`9e880451` B 类「连选/回收站确认/窗口状态/e2e 隔离」）。
+  ⇒ **是重写移植、不是 cherry-pick**，所以 `git cherry` 会把 23 个 upstream commit **全判成「未移植」**。
+  **在本项目用 `git cherry` 判「是否已合并 upstream」是错的**，必须用逐行命中率：
+  ```powershell
+  git -c http.proxy= fetch upstream main
+  node scripts/audit-upstream-port.mjs        # 取每个 upstream commit 补丁的新增行，在 AFM HEAD 逐行命中
+  ```
+  判据：命中率 ≥ 90% ≈ 已落地（差的是注释/license 头/格式化）；< 60% ≈ 真落后。
+- **`git -c http.proxy=` 的用法**：本机代理 `127.0.0.1:7897` 的 TLS 握手间歇性坏，
+  直连 github.com 正常。**所有 git 远程操作都建议带这个参数**，避免误判成仓库出问题。
+- **upstream 的 23 个 commit 里，10 个已无合并价值**（命中率 92%–100%：
+  SSRF 修复、扩展隔离加固、扩展主流程测试、Shift+方向键连选、双击标题栏最大化、
+  全屏后窗口状态恢复、SMB 移入回收站前确认、e2e 全新 Windows profile、
+  e2e 临时数据目录隔离、隔离目录删除重试）。
+- **真正还没落地的是**：CI 的 `e2e-windows` job + e2e 残留数据检查（AFM 已有全套 e2e 脚本，
+  但 `ci.yml` 里**完全没有 e2e job**）、locale JSON 末尾换行（AFM 的 `scripts/sync-i18n.js` 会把换行写掉）。
+- **仪表盘重设计是产品决策、不是合并决策**：upstream 把 77,327 字符的单体 `dashboard.vue`
+  拆成 495 行 + 约 20 个新组件（标签侧栏/按类型筛选/缩略图预览/拖拽打标签…），
+  但它**删掉了** `entry-card-tags.vue` 与 `dashboard-tag-section-header.vue`（AFM 正在用），
+  且需要 `removeTagFromAllItems` / `removeTaggedItem` 两个存储函数（AFM 的 `user-stats.ts` 里没有），
+  而 AFM 自己有 upstream 没有的**收藏分类**。**建议只搬纯函数工具、不整体换 UI**。
+
 ## 3. 代码导航：graphify 知识图谱
 
 本项目的**内层仓库** `sigma-file-manager/` 已建好本地 AST 知识图谱（2026-10-21 部署）：**零 LLM、零 API 成本、纯本地**，产物在 `sigma-file-manager/graphify-out/`（已加进 `.gitignore`，不进版本库）。
