@@ -56,8 +56,12 @@
   所以工作副本里的 `.superpowers/`（150 多个一次性 `.cjs` 脚本，`.superpowers/sdd/.gitignore` 是 `*`，
   整个目录不进版本库）会被一起 lint —— 同一个提交，工作副本里量到 **689 errors**，干净检出里只有 **177**。
   已把 `.superpowers/**` 与 `graphify-out/**` 写进 `eslint.config.ts` 的 `globalIgnores`
-  （与已有的 `_acceptance/**` 同理），`eslint .` 现在稳定在 **177 errors / 0 warnings**
-  （= `eslint src` 的 170 + `eslint scripts` 的 7）。
+  （与已有的 `_acceptance/**` 同理）。
+  **2026-10-23 实测更新基线**（用 `git stash push -u` 量 HEAD、同一台机器同一条命令）：
+  `eslint .` = **188 errors / 0 warnings**，其中 `eslint src` = **175**、`eslint scripts` = 13。
+  ⚠️ 之前记的「177 / 170」**已过期** —— 3.5.0 那轮新增的
+  `compare-sync-dialog.test.ts` 带进来 5 个存量违规，`eslint src` 变成 175。
+  **基线数字会随提交变**，量的时候一律用 `git stash` 量 HEAD，别拿旧数字对。
   **看到几百个错误先按目录分组看**，别急着当成回归 —— 先分清「仓库里真有的」和「只有工作副本才有的」。
 - **单文件 `eslint --fix` 通过 ≠ 回到基线**（2026-10-15 实测）：`--fix` 会把该文件里**基线本来就有的**违规一起修掉，单文件复验会显示 0 个问题，但总数可能已经低于或高于基线。必须再跑一次全量对照才算数。
 - `$ErrorActionPreference = 'Stop'` 会把**原生命令的 stderr**变成终止错误（`NativeCommandError`），门禁脚本在调 `npm` / `npx` 前后必须显式切回 `Continue`，否则第一条 warning 输出的 stderr 就让脚本带 exit 1 退出，看起来像门禁挂了。
@@ -164,11 +168,17 @@
   e2e 临时数据目录隔离、隔离目录删除重试）。
 - **真正还没落地的是**：CI 的 `e2e-windows` job + e2e 残留数据检查（AFM 已有全套 e2e 脚本，
   但 `ci.yml` 里**完全没有 e2e job**）、locale JSON 末尾换行（AFM 的 `scripts/sync-i18n.js` 会把换行写掉）。
-- **仪表盘重设计是产品决策、不是合并决策**：upstream 把 77,327 字符的单体 `dashboard.vue`
-  拆成 495 行 + 约 20 个新组件（标签侧栏/按类型筛选/缩略图预览/拖拽打标签…），
+- **仪表盘重设计是产品决策、不是合并决策**：upstream 把合并基线上那个 609 行 / 18,853 字符的
+  `dashboard.vue` 拆成 545 行 + 8 个新组件（标签侧栏/按类型筛选/缩略图预览/拖拽排序…）+ 2 个新 composable，
   但它**删掉了** `entry-card-tags.vue` 与 `dashboard-tag-section-header.vue`（AFM 正在用），
   且需要 `removeTagFromAllItems` / `removeTaggedItem` 两个存储函数（AFM 的 `user-stats.ts` 里没有），
-  而 AFM 自己有 upstream 没有的**收藏分类**。**建议只搬纯函数工具、不整体换 UI**。
+  而 AFM 自己有 upstream 没有的**收藏分类**（AFM 的仪表盘 938 行 / 30,362 字符，比 upstream 旧版大 60%）。
+  **建议按能力逐项移植，不要整体替换页面骨架。**
+  已经被 upstream 证明「可低风险单独搬」的三块，本仓已落地：
+  `src/utils/tagged-sections.ts`（分组逻辑）、`src/utils/page-drop-targets.ts`（拖放目标）、
+  `src/utils/tag-colors.ts`（色板去重）。
+  ⇒ 「只搬纯函数」这条建议是对的，但**要挑 AFM 已经内联了同一套逻辑的那几个**（搬过去等于去重 + 补测试），
+  其余的搬进来就是**死代码**（没有 UI 入口就没人调）。
 
 ## 3. 代码导航：graphify 知识图谱
 
