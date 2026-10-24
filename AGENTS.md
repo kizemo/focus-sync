@@ -216,6 +216,57 @@
   表现为「AFM main window never appeared」，但应用其实好好地起来了
   ⇒ 用 `afm-capture-only.ps1` 只抓不重启。
 
+### 2.4 winget 发布与 GitHub 素材（2026-10-24 新增）
+
+- **winget 清单不需要带 `winget` scope 的令牌**（实测）：那个 scope 只给
+  「Submit new package」工具用，**直接开 PR 就行**（上游 CONTRIBUTING 明写
+  「routine manifest submissions do not need a separate issue」）。
+  流程 = fork `microsoft/winget-pkgs` → 从 `master` 拉分支 → 提交清单 → 向 `master` 开 PR；
+  上游的 GitHub App 会自动跑校验流水线（下载安装包核对哈希、跑 `winget validate`、沙箱试装）。
+- **目录结构是 `manifests/<包 ID 首字母小写>/<包名>/<包 ID>/<版本>/`**，一个版本一个目录，
+  里面四个文件：`<ID>.yaml`（version）、`<ID>.installer.yaml`（installer）、
+  `<ID>.locale.en-US.yaml` 与 `<ID>.locale.zh-CN.yaml`（defaultLocale）。
+  schema 用 **1.12.0**（PR 模板指定的版本；仓库里虽然已有 1.28.0，模板仍指向 1.12）；
+  PR 标题格式 `New package: <包 ID> version <版本>`。本仓的原文存在 `docs/winget/`。
+- **清单里的 `Publisher` 必须等于安装器写进 Windows ARP 的发布者**，否则包管理器
+  不认得你机器上装的是清单里那个程序，升级也就不会接管。来源链：
+  `tauri.conf.json` 的 `bundle.publisher` → NSIS 模板 `!define MANUFACTURER` →
+  `WriteRegStr ... "Publisher"`。
+  ⚠️ **Tauri v2 的 `bundle.publisher` 默认取 identifier 的第二段**
+  （本仓 identifier `com.sigma-file-manager.app` ⇒ 默认 `sigma-file-manager`），
+  所以想写 `kizemo` 必须**显式**设 `bundle.publisher`；
+  一改就**必须重新打包 + 重新发版**（哈希变、ARP 发布者变），再提交清单。
+- **本机没有 `winget` 命令行**：App Installer 装了（1.29.379.0），但 `winget.exe` 的
+  别名没注册，且从 `C:\Program Files\WindowsApps\...` 直接执行报 **Access is denied**
+  ⇒ 本地 `winget validate` / `winget install --manifest` 跑不了，只能交给上游流水线。
+  **安装包也没有代码签名**（`Get-AuthenticodeSignature` ⇒ `NotSigned`），
+  上游评审通常会要求签名 ⇒ 需要发布者自备证书。
+- **孤立的 CR 字节是一颗地雷**（2026-10-24 实测，代价是一轮打包白跑）：
+  `src-tauri/src/extensions/http.rs` 有一行注释中间夹了个裸 `0x0D`，
+  rustc 把 CR 当空白 ⇒ 整行仍是注释、能编译；
+  但**任何规范化行尾的写入路径**（编辑器、带 eol=crlf 的 `git checkout`、文本编辑 API）
+  都会把它变成真换行 ⇒ 注释后半句变成裸代码 ⇒ **整个 crate 编译失败**
+  （本轮 10 个错误，`extensions/github.rs` / `extensions/filesystem.rs` 的 E0277 全是级联报错）。
+  ⇒ **改任何 `.rs` 之前先扫孤立 CR**（`git show HEAD:<file>` 取原始字节比对），
+  修复用 node 按字节改，**别用会规范化行尾的写入路径**。
+  全仓扫描结果：只有这一个文件（1369 个受版本控制的文本文件）。
+- **写工具会把一个汉字写成 3 个 U+FFFD**（2026-10-24）：症状是文档里出现「双」后面跟三个 U+FFFD 替换符
+  （应为「双语」）—— 一个 3 字节 UTF-8 字符被拆成三个无效字节。
+  ⇒ 凡是写了中文的文本文件，**写完必须验** `(s.match(/\uFFFD/g)||[]).length === 0`；
+  但**有些文件里的 U+FFFD 是故意的**（`src-tauri/src/dir_reader/network_shares.rs`
+  与 `docs/superpowers/plans/2026-10-15-handoff-batch4-restart.md` 就在正文里举例乱码），
+  扫描时先排除它们再判定。
+- **`tauri build` 报 `failed to remove file ... os error 5`**（2026-10-24）：
+  是**上一轮残留的应用进程**占着 `src-tauri/target/release/alpha-file-manager.exe`。
+  release 构建下 `SFM_E2E_DATA_DIR` 被编译掉 ⇒ 那个进程一退就会把内存里的统计状态
+  写回真实 `user-stats.json` ⇒ **打包前先确认 `Get-Process alpha-file-manager` 为空**。
+- **HelloGitHub 的提交表单没有独立路由**：导航里的「提交项目」是**客户端弹出的模态框**；
+  `/submit` 一类路径全是 404，真实存在的只有 `/report/contribution`（那是**贡献排行榜**，不是表单）。
+  登录入口是侧栏的「立即登录」与 `/user/login`（会再跳回首页）。
+  ⚠️ **自动化点击在 HelloGitHub 上会超时**：页面有持续动画，工具的「元素稳定」前置检查
+  等不到稳定帧 ⇒ `click` 275 秒超时**且点击根本没派发**；而 `query`（text/semantic）
+  只要 150–200 毫秒 ⇒ **读页面用 query，登录与交互交给人**。
+
 ## 3. 代码导航：graphify 知识图谱
 
 本项目的**内层仓库** `sigma-file-manager/` 已建好本地 AST 知识图谱（2026-10-21 部署）：**零 LLM、零 API 成本、纯本地**，产物在 `sigma-file-manager/graphify-out/`（已加进 `.gitignore`，不进版本库）。
