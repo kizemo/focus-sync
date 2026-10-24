@@ -297,6 +297,19 @@
   真正的清单校验由 `wingetvalidator-prod[bot]` 这个 App 跑；新包会先被自动打上
   `Project-File` 标签，校验随后才开始（要下载安装包核对哈希 + 沙箱试装，十几分钟起步）。
   ⇒ **PR 提交后没有立刻出现校验结果属正常**，别急着重提。
+- **第 08 步「沙箱试装」可能跑 35 分钟以上，别当卡死**（2026-10-24 实测）：
+  本项目 3.5.1 那轮从 07:10 跑到 07:45，而同期其它包样本约 10 分钟。
+  根因：`tauri.conf.json` **没配 `webviewInstallMode`**，Tauri v2 默认
+  `downloadBootstrapper` ⇒ 沙箱机器没装 WebView2 运行时时，安装过程要联网下载
+  引导程序再装运行时（~130MB）。**是安装耗时，不是挂起。**
+  ⚠️ 取舍：`offlineInstaller` ⇒ 安装包多 ~130MB；`skip` ⇒ 目标机没 WebView2 就跑不起来。
+- **校验全绿之后，剩下的是社区版主人工评审**（2026-10-24 实测）：
+  机器人会留言 "The check-in policies require a moderator to approve PRs from the
+  community… please be patient"。已合并的上游 PR 标签是
+  `Validation-Completed` + `Azure-Pipeline-Passed` + `Moderator-Approved` + `New-Package`
+  —— **`Moderator-Approved` 是版主加的，我们加不了也不该加**；`@wingetbot run` 同理。
+  合并前要做的准备：**先签 CLA**（账号级，签一次对 microsoft 各仓库通用），
+  否则会一直挂着 `Needs-CLA` 标签。
 - **孤立的 CR 字节是一颗地雷**（2026-10-24 实测，代价是一轮打包白跑）：
   `src-tauri/src/extensions/http.rs` 有一行注释中间夹了个裸 `0x0D`，
   rustc 把 CR 当空白 ⇒ 整行仍是注释、能编译；
