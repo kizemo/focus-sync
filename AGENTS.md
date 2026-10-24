@@ -225,12 +225,30 @@
   上游的 GitHub App 会自动跑校验流水线（下载安装包核对哈希、跑 `winget validate`、沙箱试装）。
 - **目录结构是 `manifests/<发布者首字母小写>/<发布者>/<应用名>/<版本>/`**，一个版本一个目录，
   里面四个文件：`<包 ID>.yaml`（version）、`<包 ID>.installer.yaml`（installer）、
-  `<包 ID>.locale.en-US.yaml` 与 `<包 ID>.locale.zh-CN.yaml`（defaultLocale）。
+  `<包 ID>.locale.en-US.yaml`（**defaultLocale**）与 `<包 ID>.locale.zh-CN.yaml`（**locale**）。
+  ⚠️ **同一个版本目录里，每种 `ManifestType` 只允许一份文件**（2026-10-24 实测踩中）：
+  两份 locale 文件都写 `defaultLocale` ⇒ 上游判 `DuplicateMultiFileManifestType`
+  （"The multi file manifest should contain only one file with the particular ManifestType"），
+  校验在第 02 步就停掉。规则出处：`microsoft/winget-cli` 的
+  `src/AppInstallerCommonCore/Manifest/YamlParser.cpp` —— `Version` / `Installer` / `DefaultLocale`
+  各有「已找到」标志位，重复即报错；`Locale` 分支只查 `PackageLocale` 重复
+  （错误码 `DuplicateMultiFileManifestLocale`），**允许多份**。
+  另外 `version` 文件的 `DefaultLocale` 必须等于 `defaultLocale` 文件的 `PackageLocale`，
+  否则判 `InconsistentMultiFileManifestDefaultLocale`。
+  ⚠️ **两个 locale schema 的字段表不一样**（`aka.ms/winget-manifest.*.1.12.0.schema.json`）：
+  `defaultLocale` 必填 `Publisher` / `PackageName` / `License` / `ShortDescription`，
+  `locale` 只必填 `PackageIdentifier` / `PackageVersion` / `PackageLocale` / `ManifestType` / `ManifestVersion`；
+  而且 **`Moniker` 只出现在 `defaultLocale` 的字段表里**，`locale` 的字段表里没有
+  ⇒ 完整元数据（`Publisher`/`PackageName`/`License`/`Moniker`…）一律留在 `defaultLocale` 文件，
+  `locale` 文件只放翻译过的 `ShortDescription` / `Description` / `Tags`。
+  对照上游真实多语言包：`manifests/m/Microsoft/AKSdesktop/0.43.0/`。
   ⚠️ **中间那层是「包 ID 按点拆开后的发布者段」，不是包名**：
   `kizemo.AlphaFileManager` ⇒ 发布者层 `kizemo`、应用层 `AlphaFileManager`；
   包名 `Alpha File Manager`（带空格）**不能**当目录名。
   对照组（同期已被受理的 PR）：`manifests/j/Justsenger/ExHyperV/1.5.2/Justsenger.ExHyperV.yaml`、
   `manifests/o/OpenAI/ChatGPT/26.1021.3705.0/OpenAI.ChatGPT.yaml`。
+  ⚠️ **上游的发布者目录名保留原始大小写**（`manifests/m/Microsoft/...`，不是 `manifests/m/microsoft/...`），
+  拿上游目录当模板时别自己小写化，否则 contents API 直接 404。
   ⚠️ **踩过的坑（本轮 PR 被机器人打回 "missing the manifests folder"）**：
   用 contents API 提交时，若相对路径是**以 `.../winget/manifests` 为基准**算出来的，
   `manifests/` 这层根目录会被吃掉，文件落到仓库根下的 `k/...` —— 机器人直接判缺目录。
@@ -309,6 +327,20 @@
   ⇒ **判别方法**：先 `inspect` 一次，`durationMs` 上百毫秒以内就说明页面已稳定，可以点；
   超时则说明页面还在抖，先让页面加载完（或改用 `query` 读内容）再点。
   ⇒ **读页面用 `query`（text/semantic，100–200ms）**，比 `inspect` 稳，也比它便宜。
+- **Markdown 表格只有两类是真缺陷，判据照 GFM 规范**（2026-10-24 实测）：
+  规范原文（`github/gfm` §4.10 Tables）：
+  > The header row must match the delimiter row in the number of cells. If not, a table will not be recognized.
+  >
+  > The remainder of the table's rows may vary in the number of cells. If there are a number of cells fewer than the number of cells in the header row, empty cells are inserted. If there are greater, the excess is ignored.
+
+  ⇒ ① **分隔行 ≠ 表头** ⇒ 整块**不被识别成表格**，塌成一段话（用户第一次报的那个 README 缺陷）。
+  ⇒ ② **数据行比表头多列** ⇒ 多出来的列被**静默丢弃**（表还在，内容没了）。
+  ⇒ **数据行比表头少列不是缺陷**（GFM 会补空单元格）—— 早先的门禁把它算成错误，那是误报。
+  ⚠️ 单元格正文里的 `|` 必须写成 `\|`，否则那一行会被拆成多列，多余列直接被丢。
+  内层仓已有机器门禁：`sigma-file-manager/src/utils/__tests__/readme-markdown-table.test.ts`
+  （覆盖根 README + `docs/**/*.md`，判据与 GFM 对齐，77 条用例，含负向用例）。
+- **winget 清单 PR 的当前编号**：`https://github.com/microsoft/winget-pkgs/pull/460744`
+  （第一个 PR #460692 因清单路径写错已关闭；#460744 是干净重开的那一个）。
 
 ## 3. 代码导航：graphify 知识图谱
 
