@@ -36,7 +36,7 @@
 | 语言包 17 个,中文是 `ch` | `src/localization/messages/*.json` |
 | **i18n 无 key 对齐测试** | `__tests__/messages-json.test.ts` **只验证 JSON 可解析** |
 | **i18n 无 fallbackLocale** | `src/localization/index.ts:9-13`,`createI18n` 未配该字段 |
-| **项目无通用撤销机制** | Rust 侧 `undo|rollback` 命中项全为注册表操作专用 |
+| **项目无通用撤销机制** | Rust 侧 `undo\|rollback` 命中项全为注册表操作专用 |
 | 现有 rename 相关 i18n | `navigator.renameSelectedItems`、`dialogs.renameDirItemDialog.*`、`navigator.actions.rename` |
 
 ### 1.1 由上述勘察推出的三个必避坑
