@@ -223,9 +223,18 @@
   「routine manifest submissions do not need a separate issue」）。
   流程 = fork `microsoft/winget-pkgs` → 从 `master` 拉分支 → 提交清单 → 向 `master` 开 PR；
   上游的 GitHub App 会自动跑校验流水线（下载安装包核对哈希、跑 `winget validate`、沙箱试装）。
-- **目录结构是 `manifests/<包 ID 首字母小写>/<包名>/<包 ID>/<版本>/`**，一个版本一个目录，
-  里面四个文件：`<ID>.yaml`（version）、`<ID>.installer.yaml`（installer）、
-  `<ID>.locale.en-US.yaml` 与 `<ID>.locale.zh-CN.yaml`（defaultLocale）。
+- **目录结构是 `manifests/<发布者首字母小写>/<发布者>/<应用名>/<版本>/`**，一个版本一个目录，
+  里面四个文件：`<包 ID>.yaml`（version）、`<包 ID>.installer.yaml`（installer）、
+  `<包 ID>.locale.en-US.yaml` 与 `<包 ID>.locale.zh-CN.yaml`（defaultLocale）。
+  ⚠️ **中间那层是「包 ID 按点拆开后的发布者段」，不是包名**：
+  `kizemo.AlphaFileManager` ⇒ 发布者层 `kizemo`、应用层 `AlphaFileManager`；
+  包名 `Alpha File Manager`（带空格）**不能**当目录名。
+  对照组（同期已被受理的 PR）：`manifests/j/Justsenger/ExHyperV/1.5.2/Justsenger.ExHyperV.yaml`、
+  `manifests/o/OpenAI/ChatGPT/26.1021.3705.0/OpenAI.ChatGPT.yaml`。
+  ⚠️ **踩过的坑（本轮 PR 被机器人打回 "missing the manifests folder"）**：
+  用 contents API 提交时，若相对路径是**以 `.../winget/manifests` 为基准**算出来的，
+  `manifests/` 这层根目录会被吃掉，文件落到仓库根下的 `k/...` —— 机器人直接判缺目录。
+  ⇒ **相对路径必须以包含 `manifests/` 的那一层为基准**。
   schema 用 **1.12.0**（PR 模板指定的版本；仓库里虽然已有 1.28.0，模板仍指向 1.12）；
   PR 标题格式 `New package: <包 ID> version <版本>`。本仓的原文存在 `docs/winget/`。
 - **清单里的 `Publisher` 必须等于安装器写进 Windows ARP 的发布者**，否则包管理器
@@ -249,6 +258,22 @@
   **只能由账号本人决定**，agent 不得替用户选；代发用
   `gh pr comment <n> --repo microsoft/winget-pkgs --body '@microsoft-github-policy-service agree'`
   即可（运行时令牌的身份就是 PR 作者）。**同一个 GitHub 账号对 microsoft 各仓库只需签一次**。
+- **winget PR 的状态看标签，不看 check runs**（2026-10-24 实测）：
+  校验 App 在一次 operation 结束后会**把自己的 10 条 check run 删掉** ⇒
+  「没有 check run」往往意味着**已经跑完了**，不是没跑。真正的状态在 PR 标签上：
+  `Validation-Completed`（通过，常同时有 `Azure-Pipeline-Passed`）、`Validation-Executable-Error`
+  （校验脚本自身出错）、`Validation-Installation-Error`（沙箱试装失败）、
+  `Validation-Defender-Error`（安装包被 Defender 拦）、`Validation-Guide`（给了你指引）、
+  `Needs-Author-Feedback` / `Needs-Attention`（要你回复）。
+  **重跑校验只有两条路**：① 版主在 PR 里发 `@wingetbot run`（**非版主发会被拒**：
+  机器人回 "Commenter does not have sufficient privileges"）；
+  ② **推一个新的 commit**（`synchronize` 事件）——但**不能是空提交**：
+  空提交会被策略机器人判成 `noContent`（"This pull request does not update any files"）。
+  ⇒ 想重跑就往清单里塞一行**真实的注释**再推。
+  ⚠️ 校验服务本身也会抽风：2026-10-24 我们的 operation 报
+  `Internal-Error-PR` / `WinGetSvcError`（03–09 步全 skipped、10 步 neutral），
+  发生在分支正在连续删/加文件的半路上 —— **operation 是在 diff 还没稳的时候算的**。
+  ⇒ **一次推到位再让它跑**（别一边改一边让它验），确实报错了就用上面的 ② 重推。
 - **上游现在的校验是「Agentic Workflow」**（2026-10-24 实测）：
   `.github/workflows/*.lock.yml` 由**打标签**触发（`pull_request_target: types: [labeled]`），
   真正的清单校验由 `wingetvalidator-prod[bot]` 这个 App 跑；新包会先被自动打上
