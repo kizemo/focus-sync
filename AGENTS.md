@@ -241,6 +241,19 @@
   ⇒ 本地 `winget validate` / `winget install --manifest` 跑不了，只能交给上游流水线。
   **安装包也没有代码签名**（`Get-AuthenticodeSignature` ⇒ `NotSigned`），
   上游评审通常会要求签名 ⇒ 需要发布者自备证书。
+- **winget 的 CLA 是在 PR 里回一行命令，不是在网页上签**（2026-10-24 实测通过）：
+  机器人 `microsoft-github-policy-service` 会在 PR 里留言，要求回复
+  `@microsoft-github-policy-service agree`（公司形式：`agree company="<公司名>"`）。
+  回复后 `license/cla` 这个 check 变 success、摘要 "All CLA requirements met."。
+  ⚠️ **两种形式是法律声明，含义不同**（个人独立拥有知识产权 vs 在为雇主工作过程中提交），
+  **只能由账号本人决定**，agent 不得替用户选；代发用
+  `gh pr comment <n> --repo microsoft/winget-pkgs --body '@microsoft-github-policy-service agree'`
+  即可（运行时令牌的身份就是 PR 作者）。**同一个 GitHub 账号对 microsoft 各仓库只需签一次**。
+- **上游现在的校验是「Agentic Workflow」**（2026-10-24 实测）：
+  `.github/workflows/*.lock.yml` 由**打标签**触发（`pull_request_target: types: [labeled]`），
+  真正的清单校验由 `wingetvalidator-prod[bot]` 这个 App 跑；新包会先被自动打上
+  `Project-File` 标签，校验随后才开始（要下载安装包核对哈希 + 沙箱试装，十几分钟起步）。
+  ⇒ **PR 提交后没有立刻出现校验结果属正常**，别急着重提。
 - **孤立的 CR 字节是一颗地雷**（2026-10-24 实测，代价是一轮打包白跑）：
   `src-tauri/src/extensions/http.rs` 有一行注释中间夹了个裸 `0x0D`，
   rustc 把 CR 当空白 ⇒ 整行仍是注释、能编译；
