@@ -185,6 +185,37 @@
   ⇒ 「只搬纯函数」这条建议是对的，但**要挑 AFM 已经内联了同一套逻辑的那几个**（搬过去等于去重 + 补测试），
   其余的搬进来就是**死代码**（没有 UI 入口就没人调）。
 
+### 2.3 GitHub 仓库门面与公开素材（2026-10-24 新增）
+
+- **对外公开的截图不能带用户真实工作区**（2026-10-24 踩到）：用户的目录里有
+  `G1销售管理`、`订单数据` 这类业务目录名，一旦入镜就是公开泄露。
+  且**目录树一旦展开某个盘根，该盘根的全部一级目录都会列出来**（C 盘根有 `办公文件`/`文件位置.xlsx`，
+  D 盘根有 `gbrain-latest`/`paddleocr-*`/`ComfyUI`…），**都不可用**。
+  ⇒ 正确做法：`subst X: <演示目录父目录>` + 标签页路径写成 `X:\AlphaFM-Demo`。
+  应用解析不出 `X:` 的物理位置 ⇒ **真实盘全部保持折叠**，只有中性演示内容可见；
+  用完 `subst X: /d` 解绑。截图脚本见 `.superpowers/sdd/afm-capture-only.ps1`（只抓不重启）
+  与 `.superpowers/sdd/hero-shot2.cjs`（建演示目录 / 写单标签 workspace / 恢复）。
+- **`LICENSE.md` 必须是许可证的规范原文**（2026-10-24）：GitHub 侧栏的许可证探测（licensee）
+  要求正文是原文；开头加一段自写的「TL;DR 摘要」就会被打断 ⇒ 侧栏显示 **NOASSERTION**，
+  第一眼像「没写许可证」。自写摘要要单独放 `NOTICE.md`，README 的 License 段同时指向两个文件。
+- **本仓在 GitHub 上是 upstream 的 fork**（`fork: true`，parent = `sigma-file-manager`）：
+  ① 部分 awesome 榜单**明文不收 fork**；② `0PandaDEV/awesome-windows` 的 README 第 5 行
+  **明文禁止 AI 生成的 PR** ⇒ 该仓库**主动跳过**，不要尝试。③ 保留 fork 还能蹭到上游 6.7k star
+  的社会证明，所以暂不 Duplicate 成独立仓库。
+- **提交 awesome 榜单前必须先读它的 `contributing.md`**（2026-10-24）：
+  `Axorax/awesome-free-apps` 只让改 `README.md`/`MOBILE.md`、**不许动 `filter/`**（自动生成）、
+  要加在**分类末尾**、commit message 用 `Add: 名称`；
+  `chrysler-stone/awesome-tauri-apps` 要**分类内按字母序**。
+  平台图标（🪟 等）**从它自己的图例行里复制**——手写代理对会变成别的字符，
+  而 `🟢` 是**带链接**的（`[🟢](仓库地址)`），不是裸字符。
+- **`gh` CLI 在 PowerShell 5.1 下的三个坑**（2026-10-24）：
+  ① `--jq` 表达式里带双引号会被 PS 吃掉 ⇒ 一律用 `node` 解析 JSON；
+  ② `--input -` 走管道会破坏 JSON ⇒ 把载荷写成 UTF-8 文件再 `--input <file>`；
+  ③ PR 的 API 路径是 `repos/{owner}/{repo}/pulls/{n}`，不是 `repos/{owner}/{repo}/{n}`。
+- **冷启动要 3 分钟**：`afm-nav-accept.ps1` 里 90 秒的等窗口上限不够，
+  表现为「AFM main window never appeared」，但应用其实好好地起来了
+  ⇒ 用 `afm-capture-only.ps1` 只抓不重启。
+
 ## 3. 代码导航：graphify 知识图谱
 
 本项目的**内层仓库** `sigma-file-manager/` 已建好本地 AST 知识图谱（2026-10-21 部署）：**零 LLM、零 API 成本、纯本地**，产物在 `sigma-file-manager/graphify-out/`（已加进 `.gitignore`，不进版本库）。
